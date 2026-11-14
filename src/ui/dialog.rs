@@ -15,6 +15,7 @@ pub fn confirm(confirm: &ConfirmState, theme: &Theme, cx: &mut Context<RootView>
     let backdrop = div()
         .absolute()
         .inset_0()
+        .occlude()
         .bg(gpui::rgba(0x00000099))
         .on_mouse_down(
             MouseButton::Left,
@@ -162,14 +163,6 @@ pub fn menu_separator(theme: &Theme) -> gpui::Div {
     div().h(px(1.)).my_1().bg(theme.border)
 }
 
-pub fn menu_label(theme: &Theme, label: SharedString) -> gpui::Div {
-    div()
-        .px_2()
-        .py_1()
-        .text_xs()
-        .text_color(theme.text_dim)
-        .child(label)
-}
 
 pub fn pull_popover(
     reference: &str,
@@ -531,11 +524,13 @@ pub fn run_dialog(
     cx: &mut Context<RootView>,
 ) -> AnyElement {
     let submitting = run.submitting;
-    let read_only = submitting;
+    let frozen = run.is_frozen(pulling);
+    let read_only = frozen;
 
     let backdrop = div()
         .absolute()
         .inset_0()
+        .occlude()
         .bg(gpui::rgba(0x000000aa))
         .on_mouse_down(
             MouseButton::Left,
@@ -599,7 +594,7 @@ pub fn run_dialog(
     body = body.child(section_header(
         "Ports",
         "+ Add port",
-        submitting,
+        frozen,
         theme,
         cx,
         |this, cx| this.add_run_port(cx),
@@ -641,7 +636,7 @@ pub fn run_dialog(
                 format!("run-port-{index}-tcp"),
                 "tcp",
                 port.proto == Proto::Tcp,
-                submitting,
+                frozen,
                 theme,
                 cx,
                 move |this| this.set_run_port_proto(index, Proto::Tcp),
@@ -650,7 +645,7 @@ pub fn run_dialog(
                 format!("run-port-{index}-udp"),
                 "udp",
                 port.proto == Proto::Udp,
-                submitting,
+                frozen,
                 theme,
                 cx,
                 move |this| this.set_run_port_proto(index, Proto::Udp),
@@ -658,7 +653,7 @@ pub fn run_dialog(
             .child(div().flex_1())
             .child(remove_button(
                 format!("run-remove-port-{index}"),
-                submitting,
+                frozen,
                 theme,
                 cx,
                 move |this| this.remove_run_port(index),
@@ -674,7 +669,7 @@ pub fn run_dialog(
     body = body.child(section_header(
         "Environment",
         "+ Add variable",
-        submitting,
+        frozen,
         theme,
         cx,
         |this, cx| this.add_run_env(cx),
@@ -714,7 +709,7 @@ pub fn run_dialog(
             )))
             .child(remove_button(
                 format!("run-remove-env-{index}"),
-                submitting,
+                frozen,
                 theme,
                 cx,
                 move |this| this.remove_run_env(index),
@@ -728,7 +723,7 @@ pub fn run_dialog(
     body = body.child(section_header(
         "Volumes",
         "+ Add volume",
-        submitting,
+        frozen,
         theme,
         cx,
         |this, cx| this.add_run_mount(cx),
@@ -770,14 +765,14 @@ pub fn run_dialog(
                 format!("run-mount-{index}-ro"),
                 "ro",
                 mount.read_only,
-                submitting,
+                frozen,
                 theme,
                 cx,
                 move |this| this.toggle_run_mount_read_only(index),
             ))
             .child(remove_button(
                 format!("run-remove-mount-{index}"),
-                submitting,
+                frozen,
                 theme,
                 cx,
                 move |this| this.remove_run_mount(index),
@@ -849,7 +844,7 @@ pub fn run_dialog(
             }));
     }
 
-    let can_run = !run.form.image.trim().is_empty() && !submitting;
+    let can_run = !run.form.image.trim().is_empty() && !frozen;
     let mut run_button = div()
         .id("run-submit")
         .px_3()

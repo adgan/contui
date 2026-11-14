@@ -30,6 +30,7 @@ pub struct RunState {
     pub submitting: bool,
     pub submitted: Option<RunSpec>,
     pub pull_then_retry: bool,
+    pub epoch: u64,
 }
 
 impl RunState {
@@ -40,6 +41,27 @@ impl RunState {
             None
         }
     }
+
+    /// Starts the retry attempt: freezes the form as submitting, clears the
+    /// stale error, and returns the exact spec to send.
+    pub fn begin_retry(&mut self, epoch: u64) -> Option<RunSpec> {
+        if !self.pull_then_retry {
+            return None;
+        }
+        let spec = self.submitted.clone()?;
+        self.pull_then_retry = false;
+        self.daemon_error = None;
+        self.missing_image = false;
+        self.submitting = true;
+        self.epoch = epoch;
+        Some(spec)
+    }
+
+    /// The form is frozen while the daemon is creating the container and while
+    /// a retry pull is in flight, so what is visible is what will run.
+    pub fn is_frozen(&self, pulling: bool) -> bool {
+        self.submitting || (self.pull_then_retry && pulling)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +70,7 @@ pub struct PullState {
     pub reference: String,
     pub status: String,
     pub layers: BTreeMap<String, (u64, u64)>,
+    pub epoch: u64,
 }
 
 impl PullState {
@@ -110,7 +133,7 @@ pub struct RunOutcome {
 
 #[derive(Default)]
 pub struct Mutations {
-    pub pending: BTreeMap<(ResourceKind, String), ActionKind>,
+    pub pending: BTreeMap<(ResourceKind, String), PendingAction>,
     pub confirm: Option<ConfirmState>,
     pub run: Option<RunState>,
     pub pull: Option<PullState>,
@@ -121,6 +144,15 @@ pub struct Mutations {
     pub hovered_row: Option<String>,
     pub row_menu: Option<RowMenuState>,
     pub pending_select: Option<String>,
+    /// Bumped whenever in-flight state is abandoned, so a late response from
+    /// the previous attempt can never clear or complete the next one.
+    pub epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingAction {
+    pub action: ActionKind,
+    pub epoch: u64,
 }
 
 fn key(target: &Target) -> (ResourceKind, String) {
@@ -142,6 +174,7 @@ impl Mutations {
     pub fn clear_in_flight(&mut self) {
         self.pending.clear();
         self.pull = None;
+        self.epoch = self.epoch.wrapping_add(1);
         if let Some(confirm) = &mut self.confirm {
             confirm.submitting = false;
         }
@@ -155,6 +188,7 @@ impl Mutations {
         self.pending.contains_key(&key(target))
     }
 
+
     /// Returns false when this target already has an action in flight, so a
     /// double click never queues the same mutation twice.
     pub fn begin(&mut self, target: &Target, action: ActionKind) -> bool {
@@ -162,7 +196,13 @@ impl Mutations {
         if self.pending.contains_key(&key) {
             return false;
         }
-        self.pending.insert(key, action);
+        self.pending.insert(
+            key,
+            PendingAction {
+                action,
+                epoch: self.epoch,
+            },
+        );
         true
     }
 
@@ -182,10 +222,12 @@ impl Mutations {
         &mut self,
         target: Target,
         action: ActionKind,
+        epoch: u64,
         error: Option<String>,
     ) -> ActionOutcome {
         let key = key(&target);
-        if self.pending.get(&key) != Some(&action) {
+        let expected = PendingAction { action, epoch };
+        if self.pending.get(&key) != Some(&expected) {
             return ActionOutcome {
                 refetch: error.is_none(),
                 ..Default::default()
@@ -236,6 +278,7 @@ impl Mutations {
         &mut self,
         origin: PullOrigin,
         reference: &str,
+        epoch: u64,
         layer: Option<String>,
         status: String,
         detail: Option<(u64, u64)>,
@@ -243,7 +286,7 @@ impl Mutations {
         let Some(pull) = &mut self.pull else {
             return false;
         };
-        if pull.origin != origin || pull.reference != reference {
+        if pull.origin != origin || pull.reference != reference || pull.epoch != epoch {
             return false;
         }
         pull.status = status;
@@ -255,12 +298,12 @@ impl Mutations {
         &mut self,
         origin: PullOrigin,
         reference: &str,
+        epoch: u64,
         error: Option<String>,
     ) -> PullOutcome {
-        let ours = self
-            .pull
-            .as_ref()
-            .is_some_and(|pull| pull.origin == origin && pull.reference == reference);
+        let ours = self.pull.as_ref().is_some_and(|pull| {
+            pull.origin == origin && pull.reference == reference && pull.epoch == epoch
+        });
         if !ours {
             return PullOutcome {
                 refetch: error.is_none(),
@@ -269,10 +312,8 @@ impl Mutations {
         }
         self.pull = None;
 
-        let retry_dialog = self
-            .run
-            .as_ref()
-            .is_some_and(|run| run.pull_then_retry);
+        let retry_dialog = origin == PullOrigin::RunRetry
+            && self.run.as_ref().is_some_and(|run| run.pull_then_retry);
         match (error, retry_dialog) {
             (None, true) => PullOutcome {
                 retry_run: true,
@@ -294,6 +335,7 @@ impl Mutations {
             }
             (Some(message), false) => {
                 self.pull_input = reference.to_string();
+                self.pull_error = Some(message.clone());
                 PullOutcome {
                     retry_run: false,
                     refetch: true,
@@ -306,11 +348,16 @@ impl Mutations {
         }
     }
 
-    pub fn apply_run_created(&mut self, id: String, warnings: Vec<String>) -> RunOutcome {
+    pub fn apply_run_created(
+        &mut self,
+        id: String,
+        warnings: Vec<String>,
+        epoch: u64,
+    ) -> RunOutcome {
         let applies = self
             .run
             .as_ref()
-            .is_some_and(|run| run.submitting);
+            .is_some_and(|run| run.submitting && run.epoch == epoch);
         if !applies {
             return RunOutcome {
                 refetch: true,
@@ -334,11 +381,12 @@ impl Mutations {
         message: String,
         missing_image: bool,
         created: Option<String>,
+        epoch: u64,
     ) -> RunOutcome {
         let applies = self
             .run
             .as_ref()
-            .is_some_and(|run| run.submitting);
+            .is_some_and(|run| run.submitting && run.epoch == epoch);
         if !applies {
             return RunOutcome {
                 refetch: created.is_some(),
@@ -389,6 +437,20 @@ pub fn confirm_copy(kind: ResourceKind, title: &str, tag_count: usize) -> (Strin
     }
 }
 
+pub fn clamp_menu_position(
+    x: f32,
+    y: f32,
+    menu_width: f32,
+    menu_height: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> (f32, f32) {
+    (
+        x.min((viewport_width - menu_width).max(0.0)).max(0.0),
+        y.min((viewport_height - menu_height).max(0.0)).max(0.0),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +477,7 @@ mod tests {
             reference: reference.into(),
             status: String::new(),
             layers: Default::default(),
+            epoch: 0,
         }
     }
 
@@ -434,6 +497,7 @@ mod tests {
         let late = m.apply_action_done(
             target(ResourceKind::Container, "a"),
             ActionKind::Stop,
+            m.epoch,
             Some("gone".into()),
         );
         assert!(!late.refetch && late.toast.is_none() && !m.pending.is_empty());
@@ -449,6 +513,7 @@ mod tests {
         let out = m.apply_action_done(
             target(ResourceKind::Container, "a"),
             ActionKind::Remove,
+            m.epoch,
             Some("is running".into()),
         );
         assert!(out.toast.is_none());
@@ -464,9 +529,11 @@ mod tests {
     fn stale_pull_updates_are_ignored() {
         let mut m = Mutations::new();
         m.pull = Some(pull_state(PullOrigin::Header, "nginx"));
+        let epoch = m.pull.as_ref().unwrap().epoch;
         assert!(m.apply_pull_progress(
             PullOrigin::Header,
             "nginx",
+            epoch,
             Some("l1".into()),
             "Downloading".into(),
             Some((1, 10))
@@ -474,6 +541,7 @@ mod tests {
         assert!(!m.apply_pull_progress(
             PullOrigin::Header,
             "redis",
+            epoch,
             Some("l1".into()),
             "Downloading".into(),
             Some((1, 10))
@@ -481,13 +549,19 @@ mod tests {
         assert!(!m.apply_pull_progress(
             PullOrigin::RunRetry,
             "nginx",
+            epoch,
             Some("l1".into()),
             "Downloading".into(),
             Some((1, 10))
         ));
-        let stale_error = m.apply_pull_done(PullOrigin::Header, "redis", Some("boom".into()));
+        let stale_error = m.apply_pull_done(
+            PullOrigin::Header,
+            "redis",
+            epoch,
+            Some("boom".into()),
+        );
         assert!(!stale_error.refetch && stale_error.toast.is_none() && m.pull.is_some());
-        let stale_success = m.apply_pull_done(PullOrigin::Header, "redis", None);
+        let stale_success = m.apply_pull_done(PullOrigin::Header, "redis", epoch, None);
         assert!(
             stale_success.refetch && m.pull.is_some(),
             "a late success still refetches"
@@ -513,6 +587,7 @@ mod tests {
         let out = m.apply_pull_done(
             PullOrigin::Header,
             "bad:1",
+            m.pull.as_ref().unwrap().epoch,
             Some("manifest unknown".into()),
         );
         assert!(out.refetch);
@@ -522,6 +597,7 @@ mod tests {
             m.pull_input, "bad:1",
             "the reference is kept for a one-click retry"
         );
+        assert_eq!(m.pull_error.as_deref(), Some("manifest unknown"));
         assert!(m.pull.is_none());
     }
 
@@ -534,7 +610,8 @@ mod tests {
             ..run_state(true, true)
         });
         m.pull = Some(pull_state(PullOrigin::RunRetry, "nginx"));
-        let out = m.apply_pull_done(PullOrigin::RunRetry, "nginx", None);
+        let epoch = m.pull.as_ref().unwrap().epoch;
+        let out = m.apply_pull_done(PullOrigin::RunRetry, "nginx", epoch, None);
         assert!(out.retry_run && !out.refetch);
         assert!(m.run.as_ref().unwrap().submitting);
         assert!(m.pull.is_none());
@@ -545,9 +622,11 @@ mod tests {
             ..run_state(true, true)
         });
         failed.pull = Some(pull_state(PullOrigin::RunRetry, "nginx"));
+        let epoch = failed.pull.as_ref().unwrap().epoch;
         let out = failed.apply_pull_done(
             PullOrigin::RunRetry,
             "nginx",
+            epoch,
             Some("manifest unknown".into()),
         );
         assert!(!out.retry_run && !out.refetch && out.toast.is_none());
@@ -560,14 +639,19 @@ mod tests {
     fn run_outcomes_select_the_created_container() {
         let mut m = Mutations::new();
         m.run = Some(run_state(true, false));
-        let out = m.apply_run_created("abc".into(), vec![]);
+        let out = m.apply_run_created("abc".into(), vec![], m.epoch);
         assert!(out.close_dialog && out.refetch);
         assert_eq!(out.select_container.as_deref(), Some("abc"));
         assert!(m.run.is_none());
 
         let mut m = Mutations::new();
         m.run = Some(run_state(true, false));
-        let out = m.apply_run_failed("port is allocated".into(), false, Some("abc".into()));
+        let out = m.apply_run_failed(
+            "port is allocated".into(),
+            false,
+            Some("abc".into()),
+            m.epoch,
+        );
         assert!(out.close_dialog && out.refetch);
         assert_eq!(out.select_container.as_deref(), Some("abc"));
         assert_eq!(out.toast.unwrap().text, "port is allocated");
@@ -601,7 +685,7 @@ mod tests {
     fn a_missing_image_stays_in_the_dialog() {
         let mut m = Mutations::new();
         m.run = Some(run_state(true, false));
-        let out = m.apply_run_failed("No such image".into(), true, None);
+        let out = m.apply_run_failed("No such image".into(), true, None, m.epoch);
         assert!(!out.close_dialog && !out.refetch && out.toast.is_none());
         assert!(m.run.as_ref().unwrap().missing_image);
         assert!(!m.run.as_ref().unwrap().submitting);
@@ -628,5 +712,133 @@ mod tests {
         assert!(!single.contains("every tag"));
         let (_, volume) = confirm_copy(ResourceKind::Volume, "db-data", 0);
         assert!(volume.contains("data"));
+    }
+
+    #[test]
+    fn run_retry_sets_submitting_and_returns_the_submitted_spec() {
+        let submitted = RunSpec {
+            image: "postgres:19".into(),
+            ..Default::default()
+        };
+        let mut run = RunState {
+            form: RunForm {
+                image: "edited:latest".into(),
+                ..Default::default()
+            },
+            submitted: Some(submitted.clone()),
+            pull_then_retry: true,
+            daemon_error: Some("No such image".into()),
+            missing_image: true,
+            ..Default::default()
+        };
+        assert_eq!(run.begin_retry(7), Some(submitted));
+        assert!(run.submitting);
+        assert!(!run.pull_then_retry);
+        assert!(run.daemon_error.is_none());
+        assert!(!run.missing_image);
+        assert_eq!(run.epoch, 7);
+        assert_eq!(run.begin_retry(8), None, "a second retry must not start");
+    }
+
+    #[test]
+    fn run_is_frozen_while_submitting_or_retry_pulling() {
+        let mut run = RunState::default();
+        assert!(!run.is_frozen(false));
+        run.submitting = true;
+        assert!(run.is_frozen(false));
+        let run = RunState {
+            pull_then_retry: true,
+            ..Default::default()
+        };
+        assert!(run.is_frozen(true));
+        assert!(!run.is_frozen(false));
+    }
+
+    #[test]
+    fn disconnect_epoch_ignores_a_late_response_for_the_same_action() {
+        let mut m = Mutations::new();
+        let target = target(ResourceKind::Container, "a");
+        assert!(m.begin(&target, ActionKind::Stop));
+        let old_epoch = m.epoch;
+        m.clear_in_flight();
+        assert!(m.begin(&target, ActionKind::Stop));
+
+        let late = m.apply_action_done(
+            target.clone(),
+            ActionKind::Stop,
+            old_epoch,
+            Some("old".into()),
+        );
+        assert!(!late.refetch && late.toast.is_none());
+        assert!(
+            m.pending.contains_key(&(ResourceKind::Container, "a".to_string())),
+            "the late response must not clear the new attempt"
+        );
+
+        let current = m.apply_action_done(target, ActionKind::Stop, m.epoch, None);
+        assert!(current.refetch && m.pending.is_empty());
+    }
+
+    #[test]
+    fn a_pull_from_a_previous_epoch_is_ignored() {
+        let mut m = Mutations::new();
+        m.pull = Some(PullState {
+            epoch: 4,
+            ..pull_state(PullOrigin::Header, "nginx")
+        });
+        assert!(!m.apply_pull_progress(
+            PullOrigin::Header,
+            "nginx",
+            3,
+            Some("l".into()),
+            "Downloading".into(),
+            Some((1, 2))
+        ));
+        assert!(m.apply_pull_progress(
+            PullOrigin::Header,
+            "nginx",
+            4,
+            Some("l".into()),
+            "Downloading".into(),
+            Some((1, 2))
+        ));
+        let stale = m.apply_pull_done(PullOrigin::Header, "nginx", 3, None);
+        assert!(stale.refetch && m.pull.is_some());
+    }
+
+    #[test]
+    fn a_run_result_from_a_previous_epoch_is_ignored() {
+        let mut m = Mutations::new();
+        m.run = Some(RunState {
+            submitting: true,
+            epoch: 5,
+            ..Default::default()
+        });
+        let out = m.apply_run_created("old".into(), vec![], 4);
+        assert!(out.refetch && out.select_container.is_none());
+        assert!(m.run.is_some(), "the current dialog must stay open");
+    }
+
+    #[test]
+    fn a_run_result_with_no_dialog_only_refetches() {
+        let mut m = Mutations::new();
+        let out = m.apply_run_created("old".into(), vec![], 0);
+        assert!(out.refetch && out.select_container.is_none() && !out.close_dialog);
+    }
+
+    #[test]
+    fn menu_position_is_clamped_to_the_viewport() {
+        assert_eq!(
+            clamp_menu_position(10.0, 10.0, 200.0, 240.0, 800.0, 600.0),
+            (10.0, 10.0)
+        );
+        assert_eq!(
+            clamp_menu_position(700.0, 500.0, 200.0, 240.0, 800.0, 600.0),
+            (600.0, 360.0)
+        );
+        assert_eq!(
+            clamp_menu_position(900.0, 900.0, 200.0, 240.0, 100.0, 100.0),
+            (0.0, 0.0)
+        );
     }
 }

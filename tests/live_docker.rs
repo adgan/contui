@@ -88,6 +88,7 @@ fn cleanup_test_containers(
             service.request(Request::RemoveContainer {
                 id: container.id,
                 force: true,
+                epoch: 0,
             });
             let _ = action_error(responses, "cleanup remove");
         }
@@ -103,6 +104,7 @@ fn pull_run_stop_restart_and_force_remove_round_trip() {
     service.request(Request::PullImage {
         reference: "alpine:3.20".into(),
         origin: PullOrigin::Header,
+        epoch: 0,
     });
     let pulled = wait_for(&responses, "pull alpine:3.20", |response| {
         matches!(response, Response::PullDone { .. })
@@ -118,6 +120,7 @@ fn pull_run_stop_restart_and_force_remove_round_trip() {
     let name = format!("dockyard-live-{}", std::process::id());
     service.request(Request::RunContainer {
         spec: run_spec(&name, None),
+        epoch: 0,
     });
     let created = wait_for(&responses, "run", |response| {
         matches!(
@@ -134,18 +137,21 @@ fn pull_run_stop_restart_and_force_remove_round_trip() {
     service.request(Request::ContainerAction {
         id: id.clone(),
         action: ContainerAction::Stop,
+        epoch: 0,
     });
     assert_eq!(action_error(&responses, "stop"), None);
 
     service.request(Request::ContainerAction {
         id: id.clone(),
         action: ContainerAction::Restart,
+        epoch: 0,
     });
     assert_eq!(action_error(&responses, "restart"), None);
 
     service.request(Request::RemoveContainer {
         id: id.clone(),
         force: false,
+        epoch: 0,
     });
     let blocked = action_error(&responses, "remove running container").expect("a running container refuses a plain remove");
     assert!(
@@ -153,7 +159,7 @@ fn pull_run_stop_restart_and_force_remove_round_trip() {
         "unexpected removal error: {blocked}"
     );
 
-    service.request(Request::RemoveContainer { id, force: true });
+    service.request(Request::RemoveContainer { id, force: true, epoch: 0 });
     assert_eq!(action_error(&responses, "force remove"), None);
 }
 
@@ -166,6 +172,7 @@ fn run_with_a_taken_host_port_keeps_the_created_container() {
     service.request(Request::PullImage {
         reference: "alpine:3.20".into(),
         origin: PullOrigin::Header,
+        epoch: 0,
     });
     let pulled = wait_for(&responses, "pull alpine:3.20", |response| {
         matches!(response, Response::PullDone { .. })
@@ -181,6 +188,7 @@ fn run_with_a_taken_host_port_keeps_the_created_container() {
     let first_name = format!("dockyard-port-a-{}", std::process::id());
     service.request(Request::RunContainer {
         spec: run_spec(&first_name, Some(45999)),
+        epoch: 0,
     });
     let first = wait_for(&responses, "first run", |response| {
         matches!(
@@ -200,6 +208,7 @@ fn run_with_a_taken_host_port_keeps_the_created_container() {
     let second_name = format!("dockyard-port-b-{}", std::process::id());
     service.request(Request::RunContainer {
         spec: run_spec(&second_name, Some(45999)),
+        epoch: 0,
     });
     let second = wait_for(&responses, "second run", |response| {
         matches!(
@@ -229,11 +238,13 @@ fn run_with_a_taken_host_port_keeps_the_created_container() {
     service.request(Request::RemoveContainer {
         id: first_id,
         force: true,
+        epoch: 0,
     });
     assert_eq!(action_error(&responses, "remove first"), None);
     service.request(Request::RemoveContainer {
         id: second_id,
         force: true,
+        epoch: 0,
     });
     assert_eq!(action_error(&responses, "remove second"), None);
 }
@@ -247,6 +258,7 @@ fn list_requests_are_answered_while_a_pull_runs() {
     service.request(Request::PullImage {
         reference: "debian:bookworm-slim".into(),
         origin: PullOrigin::Header,
+        epoch: 0,
     });
     service.request(Request::FetchAll);
 

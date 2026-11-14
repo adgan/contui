@@ -11,9 +11,10 @@ use crate::ui::inspect::{build_tree, InspectNode};
 use crate::ui::mutations::{Mutations, PullState, RowMenuState, RunOutcome, RunState, Toast};
 use crate::ui::table::{ActionsColumn, ColumnWidth, SortValue, TableRow, TableSpec, TableState};
 use chrono::Utc;
-use gpui::prelude::*;use gpui::{
-    Context, Div, FocusHandle, KeyDownEvent, MouseButton, Render, SharedString, Subscription, Task,
-    Window, AnyElement, div, px, svg, uniform_list,
+use gpui::prelude::*;
+use gpui::{
+    AnyElement, Context, Div, FocusHandle, KeyDownEvent, MouseButton, Render, SharedString,
+    Subscription, Task, Window, div, px, svg, uniform_list,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -475,11 +476,12 @@ impl RootView {
             Response::ActionDone {
                 target,
                 action,
+                epoch,
                 error,
             } => {
                 let outcome = self
                     .mutations
-                    .apply_action_done(target.clone(), action, error);
+                    .apply_action_done(target.clone(), action, epoch, error);
                 if outcome.close_detail {
                     let open = self.detail.as_ref().map(|detail| (detail.kind, detail.id.clone()));
                     if open == Some((target.kind, target.id)) {
@@ -496,20 +498,24 @@ impl RootView {
             Response::PullProgress {
                 origin,
                 reference,
+                epoch,
                 layer,
                 status,
                 detail,
             } => {
-                let _ = self
-                    .mutations
-                    .apply_pull_progress(origin, &reference, layer, status, detail);
+                let _ = self.mutations.apply_pull_progress(
+                    origin, &reference, epoch, layer, status, detail,
+                );
             }
             Response::PullDone {
                 origin,
                 reference,
+                epoch,
                 error,
             } => {
-                let outcome = self.mutations.apply_pull_done(origin, &reference, error);
+                let outcome = self
+                    .mutations
+                    .apply_pull_done(origin, &reference, epoch, error);
                 if outcome.retry_run {
                     self.retry_run_after_pull();
                 }
@@ -520,18 +526,23 @@ impl RootView {
                     self.refresh();
                 }
             }
-            Response::ContainerCreated { id, warnings } => {
-                let outcome = self.mutations.apply_run_created(id, warnings);
+            Response::ContainerCreated {
+                id,
+                warnings,
+                epoch,
+            } => {
+                let outcome = self.mutations.apply_run_created(id, warnings, epoch);
                 self.apply_run_outcome(outcome);
             }
             Response::RunFailed {
                 message,
                 missing_image,
                 created,
+                epoch,
             } => {
-                let outcome = self
-                    .mutations
-                    .apply_run_failed(message, missing_image, created);
+                let outcome =
+                    self.mutations
+                        .apply_run_failed(message, missing_image, created, epoch);
                 self.apply_run_outcome(outcome);
             }
         }
@@ -544,6 +555,7 @@ impl RootView {
     pub fn switch_page(&mut self, page: Page) {
         self.page = page;
         self.host_menu_open = false;
+        self.mutations.pull_open = false;
         self.refresh_if_stale();
     }
 
@@ -847,6 +859,7 @@ impl RootView {
             service.request(Request::ContainerAction {
                 id: id.to_string(),
                 action: container_action,
+                epoch: self.mutations.epoch,
             });
         }
     }
@@ -875,6 +888,7 @@ impl RootView {
         let kind = confirm.kind;
         let id = confirm.id.clone();
         let force = confirm.force;
+        let epoch = self.mutations.epoch;
         confirm.submitting = true;
         confirm.error = None;
 
@@ -885,14 +899,23 @@ impl RootView {
         if !self.mutations.begin(&target, ActionKind::Remove) {
             if let Some(confirm) = &mut self.mutations.confirm {
                 confirm.submitting = false;
+                confirm.error = Some("An action is already running".to_string());
             }
             return;
         }
         if let Some(service) = &self.service {
             match kind {
-                ResourceKind::Container => service.request(Request::RemoveContainer { id, force }),
-                ResourceKind::Image => service.request(Request::RemoveImage { id, force }),
-                ResourceKind::Volume => service.request(Request::RemoveVolume { name: id }),
+                ResourceKind::Container => service.request(Request::RemoveContainer {
+                    id,
+                    force,
+                    epoch,
+                }),
+                ResourceKind::Image => service.request(Request::RemoveImage {
+                    id,
+                    force,
+                    epoch,
+                }),
+                ResourceKind::Volume => service.request(Request::RemoveVolume { name: id, epoch }),
             }
         }
     }
@@ -983,7 +1006,7 @@ impl RootView {
         cluster
     }
 
-    fn render_row_menu(&mut self, cx: &mut Context<Self>) -> Option<Div> {
+    fn render_row_menu(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         let menu = self.mutations.row_menu.clone()?;
         let theme = self.theme.clone();
         let page = match menu.kind {
@@ -1007,21 +1030,35 @@ impl RootView {
             None
         };
 
-        let backdrop = div().absolute().inset_0().on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _event, _window, cx| {
-                this.mutations.row_menu = None;
-                cx.notify();
-            }),
+        let viewport = window.viewport_size();
+        let (menu_x, menu_y) = crate::ui::mutations::clamp_menu_position(
+            f32::from(menu.at.x),
+            f32::from(menu.at.y),
+            200.0,
+            240.0,
+            f32::from(viewport.width),
+            f32::from(viewport.height),
         );
+
+        let backdrop = div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.mutations.row_menu = None;
+                    cx.notify();
+                }),
+            );
 
         let menu_kind = menu.kind;
         let menu_id = menu.id.clone();
 
         let mut panel = div()
             .absolute()
-            .left(menu.at.x)
-            .top(menu.at.y)
+            .left(px(menu_x))
+            .top(px(menu_y))
             .w(px(200.))
             .p_1()
             .occlude()
@@ -1066,16 +1103,28 @@ impl RootView {
 
         let remove_id = menu.id.clone();
         let remove_title = title.clone();
-        panel = panel.child(row_menu_item(
-            "Remove",
-            theme.error,
-            &theme,
-            cx,
-            move |this, _cx| {
-                this.request_action(menu.kind, &remove_id, &remove_title, ActionKind::Remove);
-                this.mutations.row_menu = None;
-            },
-        ));
+        let remove_kind = menu.kind;
+        let remove_pending = self
+            .mutations
+            .pending
+            .contains_key(&(menu.kind, menu.id.clone()));
+        if !remove_pending {
+            panel = panel.child(row_menu_item(
+                "Remove",
+                theme.error,
+                &theme,
+                cx,
+                move |this, _cx| {
+                    this.request_action(
+                        remove_kind,
+                        &remove_id,
+                        &remove_title,
+                        ActionKind::Remove,
+                    );
+                    this.mutations.row_menu = None;
+                },
+            ));
+        }
 
         Some(
             div()
@@ -1211,7 +1260,7 @@ impl RootView {
             .mutations
             .pending
             .get(&(detail.kind, detail.id.clone()))
-            .map(|action| action.pending_label());
+            .map(|action| action.action.pending_label());
 
         let body: gpui::AnyElement = if let Some(error) = detail.error.clone() {
             div()
@@ -1366,23 +1415,25 @@ impl RootView {
             .child(body)
     }
 
-    pub(crate) fn start_pull(&mut self, reference: &str, origin: PullOrigin) {
+    pub(crate) fn start_pull(&mut self, reference: &str, origin: PullOrigin) -> bool {
         let reference = reference.trim();
         if reference.is_empty() || self.mutations.pull.is_some() {
-            return;
+            return false;
         }
         if self.service.is_none() {
             self.mutations.toast = Some(Toast {
                 text: "No host connection".to_string(),
                 error: true,
             });
-            return;
+            return false;
         }
+        let epoch = self.mutations.epoch;
         self.mutations.pull = Some(PullState {
             origin,
             reference: reference.to_string(),
             status: "Starting…".to_string(),
             layers: BTreeMap::new(),
+            epoch,
         });
         self.mutations.pull_error = None;
         self.mutations.pull_open = false;
@@ -1390,25 +1441,21 @@ impl RootView {
             service.request(Request::PullImage {
                 reference: reference.to_string(),
                 origin,
+                epoch,
             });
         }
+        true
     }
 
     fn retry_run_after_pull(&mut self) {
+        let epoch = self.mutations.epoch;
         let Some(run) = &mut self.mutations.run else {
             return;
         };
-        if !run.pull_then_retry {
-            return;
-        }
-        let Some(spec) = run.submitted.clone() else {
-            return;
-        };
-        run.pull_then_retry = false;
-        run.daemon_error = None;
-        run.missing_image = false;
-        if let Some(service) = &self.service {
-            service.request(Request::RunContainer { spec });
+        if let Some(spec) = run.begin_retry(epoch) {
+            if let Some(service) = &self.service {
+                service.request(Request::RunContainer { spec, epoch });
+            }
         }
     }
 
@@ -1417,7 +1464,7 @@ impl RootView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        if !self.mutations.pull_open {
+        if self.page != Page::Images || !self.mutations.pull_open {
             return None;
         }
         let theme = self.theme.clone();
@@ -1535,23 +1582,29 @@ impl RootView {
             return;
         }
         let reference = match &self.mutations.run {
-            Some(run) => run.form.image.trim().to_string(),
+            Some(run) => run
+                .submitted
+                .as_ref()
+                .map(|spec| spec.image.clone())
+                .unwrap_or_else(|| run.form.image.trim().to_string()),
             None => return,
         };
         if reference.is_empty() {
             return;
         }
-        if let Some(run) = &mut self.mutations.run {
-            run.pull_then_retry = true;
+        if self.start_pull(&reference, PullOrigin::RunRetry) {
+            if let Some(run) = &mut self.mutations.run {
+                run.pull_then_retry = true;
+            }
         }
-        self.start_pull(&reference, PullOrigin::RunRetry);
     }
 
     pub(crate) fn submit_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let epoch = self.mutations.epoch;
         let Some(run) = self.mutations.run.as_mut() else {
             return;
         };
-        if run.submitting {
+        if run.submitting || run.pull_then_retry {
             return;
         }
         match build_run_spec(&run.form) {
@@ -1571,8 +1624,9 @@ impl RootView {
                 run.submitting = true;
                 run.pull_then_retry = false;
                 run.daemon_error = None;
+                run.epoch = epoch;
                 if let Some(service) = &self.service {
-                    service.request(Request::RunContainer { spec });
+                    service.request(Request::RunContainer { spec, epoch });
                 } else {
                     run.submitting = false;
                     run.daemon_error = Some("No host connection".to_string());
@@ -2175,7 +2229,7 @@ impl RootView {
                         };
                         let text = if pending_container {
                             pending
-                                .map(|action| action.pending_label())
+                                .map(|action| action.action.pending_label())
                                 .unwrap_or_default()
                         } else {
                             cell.as_ref()
@@ -2214,10 +2268,27 @@ impl RootView {
                             emphasized,
                             cx,
                         );
+                        let cluster_hover_id = click_id.clone();
                         element = element.child(
                             div()
+                                .id(SharedString::from(format!(
+                                    "row-actions-{click_id}"
+                                )))
                                 .w(px(actions.width()))
                                 .flex_shrink_0()
+                                .on_hover(cx.listener(
+                                    move |this, hovered: &bool, _window, cx| {
+                                        if *hovered {
+                                            this.mutations.hovered_row =
+                                                Some(cluster_hover_id.clone());
+                                        } else if this.mutations.hovered_row.as_deref()
+                                            == Some(cluster_hover_id.as_str())
+                                        {
+                                            this.mutations.hovered_row = None;
+                                        }
+                                        cx.notify();
+                                    },
+                                ))
                                 .child(cluster),
                         );
                     }
@@ -2550,7 +2621,7 @@ impl Render for RootView {
         if let Some(menu) = menu {
             root = root.child(menu);
         }
-        if let Some(row_menu) = self.render_row_menu(cx) {
+        if let Some(row_menu) = self.render_row_menu(window, cx) {
             root = root.child(row_menu);
         }
         if let Some(confirm) = self.mutations.confirm.clone() {

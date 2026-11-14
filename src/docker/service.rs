@@ -51,24 +51,30 @@ pub enum Request {
     ContainerAction {
         id: String,
         action: ContainerAction,
+        epoch: u64,
     },
     RemoveContainer {
         id: String,
         force: bool,
+        epoch: u64,
     },
     RemoveImage {
         id: String,
         force: bool,
+        epoch: u64,
     },
     RemoveVolume {
         name: String,
+        epoch: u64,
     },
     PullImage {
         reference: String,
         origin: PullOrigin,
+        epoch: u64,
     },
     RunContainer {
         spec: RunSpec,
+        epoch: u64,
     },
 }
 
@@ -98,6 +104,7 @@ pub enum Response {
         target: Target,
         action: ActionKind,
         error: Option<String>,
+        epoch: u64,
     },
     PullProgress {
         origin: PullOrigin,
@@ -105,20 +112,24 @@ pub enum Response {
         layer: Option<String>,
         status: String,
         detail: Option<(u64, u64)>,
+        epoch: u64,
     },
     PullDone {
         origin: PullOrigin,
         reference: String,
         error: Option<String>,
+        epoch: u64,
     },
     ContainerCreated {
         id: String,
         warnings: Vec<String>,
+        epoch: u64,
     },
     RunFailed {
         message: String,
         missing_image: bool,
         created: Option<String>,
+        epoch: u64,
     },
 }
 
@@ -226,9 +237,10 @@ fn mutation_error(
 }
 
 async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Response>) {
-    let status = match docker.ping().await {
-        Ok(_) => HostStatus::Connected,
-        Err(err) => status_from_error(&err),
+    let status = match tokio::time::timeout(Duration::from_secs(3), docker.ping()).await {
+        Ok(Ok(_)) => HostStatus::Connected,
+        Ok(Err(err)) => status_from_error(&err),
+        Err(_) => HostStatus::Unreachable("no answer within 3s".to_string()),
     };
     let _ = resp_tx.send(Response::Status(status)).await;
 
@@ -281,7 +293,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                 }
             },
             // Implemented in the next step of this task.
-            Request::ContainerAction { id, action } => {
+            Request::ContainerAction { id, action, epoch } => {
                 let docker = docker.clone();
                 let resp_tx = resp_tx.clone();
                 tokio::spawn(async move {
@@ -307,11 +319,12 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                             target,
                             action: kind,
                             error,
+                            epoch,
                         })
                         .await;
                 });
             }
-            Request::RemoveContainer { id, force } => {
+            Request::RemoveContainer { id, force, epoch } => {
                 let docker = docker.clone();
                 let resp_tx = resp_tx.clone();
                 tokio::spawn(async move {
@@ -331,11 +344,12 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                             target,
                             action: ActionKind::Remove,
                             error,
+                            epoch,
                         })
                         .await;
                 });
             }
-            Request::RemoveImage { id, force } => {
+            Request::RemoveImage { id, force, epoch } => {
                 let docker = docker.clone();
                 let resp_tx = resp_tx.clone();
                 tokio::spawn(async move {
@@ -367,11 +381,12 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                             target,
                             action: ActionKind::Remove,
                             error,
+                            epoch,
                         })
                         .await;
                 });
             }
-            Request::RemoveVolume { name } => {
+            Request::RemoveVolume { name, epoch } => {
                 let docker = docker.clone();
                 let resp_tx = resp_tx.clone();
                 tokio::spawn(async move {
@@ -394,11 +409,12 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                             target,
                             action: ActionKind::Remove,
                             error,
+                            epoch,
                         })
                         .await;
                 });
             }
-            Request::PullImage { reference, origin } => {
+            Request::PullImage { reference, origin, epoch } => {
                 let docker = docker.clone();
                 let resp_tx = resp_tx.clone();
                 tokio::spawn(async move {
@@ -412,6 +428,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                                         origin,
                                         reference,
                                         error: Some("pull stalled for 60s".to_string()),
+                                        epoch,
                                     })
                                     .await;
                                 return;
@@ -422,6 +439,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                                         origin,
                                         reference,
                                         error: None,
+                                        epoch,
                                     })
                                     .await;
                                 return;
@@ -432,6 +450,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                                         origin,
                                         reference,
                                         error: Some(clean_error(&err)),
+                                        epoch,
                                     })
                                     .await;
                                 return;
@@ -452,6 +471,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                                         layer: info.id,
                                         status: info.status.unwrap_or_default(),
                                         detail,
+                                        epoch,
                                     })
                                     .await;
                             }
@@ -459,7 +479,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                     }
                 });
             }
-            Request::RunContainer { spec } => {
+            Request::RunContainer { spec, epoch } => {
                 let docker = docker.clone();
                 let resp_tx = resp_tx.clone();
                 tokio::spawn(async move {
@@ -481,6 +501,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                                     message: failure.message,
                                     missing_image: failure.missing_image,
                                     created: None,
+                                    epoch,
                                 })
                                 .await;
                             return;
@@ -491,6 +512,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                                     message: "timed out after 30s".to_string(),
                                     missing_image: false,
                                     created: None,
+                                    epoch,
                                 })
                                 .await;
                             return;
@@ -507,7 +529,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                     {
                         Ok(Ok(())) => {
                             let _ = resp_tx
-                                .send(Response::ContainerCreated { id, warnings })
+                                .send(Response::ContainerCreated { id, warnings, epoch })
                                 .await;
                         }
                         Ok(Err(err)) => {
@@ -517,6 +539,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                                     message: failure.message,
                                     missing_image: failure.missing_image,
                                     created: Some(id),
+                                    epoch,
                                 })
                                 .await;
                         }
@@ -526,6 +549,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                                     message: "created but did not start within 30s".to_string(),
                                     missing_image: false,
                                     created: Some(id),
+                                    epoch,
                                 })
                                 .await;
                         }
