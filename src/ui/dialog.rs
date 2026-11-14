@@ -166,3 +166,92 @@ pub fn menu_label(theme: &Theme, label: SharedString) -> gpui::Div {
         .text_color(theme.text_dim)
         .child(label)
 }
+
+pub fn pull_popover(
+    reference: &str,
+    error: Option<&str>,
+    pulling: bool,
+    focus: &gpui::FocusHandle,
+    focused: bool,
+    theme: &Theme,
+    cx: &mut Context<RootView>,
+) -> AnyElement {
+    use crate::docker::service::PullOrigin;
+    use crate::ui::widgets::text_input;
+
+    let can_pull = !reference.trim().is_empty() && !pulling;
+    let input = text_input::field(
+        "pull-input",
+        reference,
+        "image[:tag]",
+        focus,
+        focused,
+        error.is_some(),
+        pulling,
+        true,
+        theme,
+    )
+    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
+        if event.keystroke.key == "enter" {
+            let reference = this.mutations.pull_input.clone();
+            this.start_pull(&reference, PullOrigin::Header);
+            cx.notify();
+            return;
+        }
+        if text_input::edit_text(&mut this.mutations.pull_input, event, cx) {
+            this.mutations.pull_error = None;
+            cx.notify();
+        }
+    }));
+
+    let mut submit = div()
+        .id("pull-submit")
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .text_sm()
+        .text_color(if can_pull { theme.bg } else { theme.text_dim })
+        .bg(if can_pull { theme.accent } else { theme.border })
+        .child(if pulling { "Pulling…" } else { "Pull" });
+    if can_pull {
+        submit = submit
+            .cursor_pointer()
+            .hover(|style| style.opacity(0.9))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                let reference = this.mutations.pull_input.clone();
+                this.start_pull(&reference, PullOrigin::Header);
+                cx.notify();
+            }));
+    }
+
+    let mut panel = div()
+        .absolute()
+        .top(px(60.))
+        .right(px(16.))
+        .w(px(360.))
+        .p_3()
+        .occlude()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_md()
+        .bg(theme.panel)
+        .border_1()
+        .border_color(theme.border)
+        .shadow_lg()
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.text_dim)
+                .child("Pull an image from the registry"),
+        )
+        .child(input);
+
+    if let Some(error) = error {
+        panel = panel.child(div().text_xs().text_color(theme.error).child(error.to_string()));
+    }
+    panel = panel.child(div().flex().justify_end().child(submit));
+
+    panel.into_any_element()
+}
+

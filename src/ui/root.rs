@@ -1,20 +1,19 @@
 use crate::docker::actions::{container_actions, ActionKind, ContainerAction, Target};
 use crate::docker::endpoint::{discover, HostInfo, HostStatus};
-use crate::docker::model::{ContainerState, Snapshot};
-use crate::docker::service::{DockerService, Request, Response};
+use crate::docker::model::{format_bytes, ContainerState, Snapshot};
+use crate::docker::service::{DockerService, PullOrigin, Request, Response};
 use crate::theme::Theme;
 use crate::docker::model::ResourceKind;
 use crate::ui::detail::{render_logs, DetailState, DetailTab};
 use crate::ui::inspect::{build_tree, InspectNode};
-use crate::ui::mutations::{Mutations, RowMenuState, Toast};
+use crate::ui::mutations::{Mutations, PullState, RowMenuState, Toast};
 use crate::ui::table::{ActionsColumn, ColumnWidth, SortValue, TableRow, TableSpec, TableState};
 use chrono::Utc;
-use gpui::prelude::*;
-use gpui::{
+use gpui::prelude::*;use gpui::{
     Context, Div, FocusHandle, KeyDownEvent, MouseButton, Render, SharedString, Subscription, Task,
     Window, div, px, svg, uniform_list,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 const STALE_AFTER_SECS: i64 = 5;
@@ -130,6 +129,7 @@ pub struct RootView {
     pub detail: Option<DetailState>,
     search_focus: FocusHandle,
     root_focus: FocusHandle,
+    pull_focus: FocusHandle,
     focus_initialized: bool,
     activation: Option<Subscription>,
     _pump: Option<Task<()>>,
@@ -160,6 +160,7 @@ impl RootView {
             detail: None,
             search_focus: cx.focus_handle(),
             root_focus: cx.focus_handle(),
+            pull_focus: cx.focus_handle(),
             focus_initialized: false,
             activation: None,
             _pump: None,
@@ -462,10 +463,34 @@ impl RootView {
                     self.refresh();
                 }
             }
-            Response::PullProgress { .. }
-            | Response::PullDone { .. }
-            | Response::ContainerCreated { .. }
-            | Response::RunFailed { .. } => {}
+            Response::PullProgress {
+                origin,
+                reference,
+                layer,
+                status,
+                detail,
+            } => {
+                let _ = self
+                    .mutations
+                    .apply_pull_progress(origin, &reference, layer, status, detail);
+            }
+            Response::PullDone {
+                origin,
+                reference,
+                error,
+            } => {
+                let outcome = self.mutations.apply_pull_done(origin, &reference, error);
+                if outcome.retry_run {
+                    self.retry_run_after_pull();
+                }
+                if let Some(toast) = outcome.toast {
+                    self.mutations.toast = Some(toast);
+                }
+                if outcome.refetch {
+                    self.refresh();
+                }
+            }
+            Response::ContainerCreated { .. } | Response::RunFailed { .. } => {}
         }
     }
 
@@ -1248,6 +1273,131 @@ impl RootView {
             .child(body)
     }
 
+    pub(crate) fn start_pull(&mut self, reference: &str, origin: PullOrigin) {
+        let reference = reference.trim();
+        if reference.is_empty() || self.mutations.pull.is_some() {
+            return;
+        }
+        if self.service.is_none() {
+            self.mutations.toast = Some(Toast {
+                text: "No host connection".to_string(),
+                error: true,
+            });
+            return;
+        }
+        self.mutations.pull = Some(PullState {
+            origin,
+            reference: reference.to_string(),
+            status: "Starting…".to_string(),
+            layers: BTreeMap::new(),
+        });
+        self.mutations.pull_error = None;
+        self.mutations.pull_open = false;
+        if let Some(service) = &self.service {
+            service.request(Request::PullImage {
+                reference: reference.to_string(),
+                origin,
+            });
+        }
+    }
+
+    fn retry_run_after_pull(&mut self) {
+        let Some(run) = &mut self.mutations.run else {
+            return;
+        };
+        let Some(spec) = run.retry_spec() else {
+            return;
+        };
+        run.pull_then_retry = false;
+        if let Some(service) = &self.service {
+            service.request(Request::RunContainer { spec });
+        }
+    }
+
+    fn render_pull_popover(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.mutations.pull_open {
+            return None;
+        }
+        let theme = self.theme.clone();
+        let reference = self.mutations.pull_input.clone();
+        let error = self.mutations.pull_error.clone();
+        let pulling = self.mutations.pull.is_some();
+        let focused = self.pull_focus.is_focused(window);
+        Some(crate::ui::dialog::pull_popover(
+            &reference,
+            error.as_deref(),
+            pulling,
+            &self.pull_focus,
+            focused,
+            &theme,
+            cx,
+        ))
+    }
+
+    fn render_pull_strip(&mut self) -> Option<Div> {
+        let pull = self.mutations.pull.clone()?;
+        let theme = self.theme.clone();
+        let bytes = pull.bytes();
+        let fraction = pull.fraction();
+
+        let mut strip = div()
+            .h(px(32.))
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_3()
+            .bg(theme.panel)
+            .border_b_1()
+            .border_color(theme.border)
+            .text_xs()
+            .child(div().text_color(theme.text_dim).child("Pulling"))
+            .child(
+                div()
+                    .font_family("JetBrains Mono")
+                    .text_color(theme.text)
+                    .child(pull.reference.clone()),
+            );
+        if let Some((current, total)) = bytes {
+            strip = strip.child(
+                div()
+                    .text_color(theme.text_dim)
+                    .child(format!(
+                        "{} / {}",
+                        format_bytes(current as i64),
+                        format_bytes(total as i64)
+                    )),
+            );
+        }
+        strip = strip.child(
+            div()
+                .flex_1()
+                .truncate()
+                .text_color(theme.text_dim)
+                .child(pull.status.clone()),
+        );
+        if let Some(fraction) = fraction {
+            strip = strip.child(
+                div()
+                    .w(px(160.))
+                    .h(px(3.))
+                    .rounded_full()
+                    .bg(theme.border)
+                    .child(
+                        div()
+                            .h_full()
+                            .w(px(160. * fraction))
+                            .rounded_full()
+                            .bg(theme.accent),
+                    ),
+            );
+        }
+        Some(strip)
+    }
+
     fn render_rail(&mut self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme.clone();
         let mut rail = div()
@@ -1326,6 +1476,34 @@ impl RootView {
                 div().text_color(theme.text).child(query).into_any_element()
             });
 
+        let pulling = self.mutations.pull.is_some();
+        let pull_color = if pulling { theme.text_dim } else { theme.text };
+        let mut pull_button = div()
+            .id("pull-button")
+            .h(px(28.))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .rounded_md()
+            .text_sm()
+            .text_color(pull_color)
+            .child(svg().path("icons/pull.svg").size(px(14.)).text_color(pull_color))
+            .child(if pulling { "Pulling…" } else { "Pull" });
+        if !pulling {
+            pull_button = pull_button
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.hover))
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.mutations.pull_open = !this.mutations.pull_open;
+                    this.host_menu_open = false;
+                    if this.mutations.pull_open {
+                        window.focus(&this.pull_focus);
+                    }
+                    cx.notify();
+                }));
+        }
+
         div()
             .h(px(56.))
             .px_4()
@@ -1352,6 +1530,7 @@ impl RootView {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .when(self.page == Page::Images, |this| this.child(pull_button))
                     .child(search)
                     .child(
                         div()
@@ -1387,6 +1566,7 @@ impl RootView {
                             .hover(|s| s.bg(theme.hover))
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.host_menu_open = !this.host_menu_open;
+                                this.mutations.pull_open = false;
                                 if this.host_menu_open {
                                     if let Some(service) = &this.service {
                                         service.request(Request::ProbeHosts);
@@ -1903,6 +2083,10 @@ impl Render for RootView {
                 .flex_col()
                 .child(header);
 
+            if let Some(strip) = self.render_pull_strip() {
+                column = column.child(strip);
+            }
+
             if let Some(error) = self.last_error.clone() {
                 column = column.child(
                     div()
@@ -1978,6 +2162,9 @@ impl Render for RootView {
 
         root = root.child(rail).child(content);
 
+        if let Some(popover) = self.render_pull_popover(window, cx) {
+            root = root.child(popover);
+        }
         if let Some(menu) = menu {
             root = root.child(menu);
         }

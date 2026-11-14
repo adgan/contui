@@ -16,6 +16,7 @@ impl AssetSource for Assets {
             "icons/stop.svg" => Some(include_bytes!("../assets/icons/stop.svg")),
             "icons/restart.svg" => Some(include_bytes!("../assets/icons/restart.svg")),
             "icons/trash.svg" => Some(include_bytes!("../assets/icons/trash.svg")),
+            "icons/pull.svg" => Some(include_bytes!("../assets/icons/pull.svg")),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))
@@ -29,6 +30,7 @@ impl AssetSource for Assets {
             "icons/stop.svg".into(),
             "icons/restart.svg".into(),
             "icons/trash.svg".into(),
+            "icons/pull.svg".into(),
         ])
     }
 }
