@@ -1,6 +1,7 @@
 use crate::docker::endpoint::{
     discover, EndpointKind, HostInfo, HostStatus, TlsFiles,
 };
+use crate::docker::events::Debouncer;
 use crate::docker::model::{
     parse_logs, status_from_error, ContainerRow, ImageRow, LogLine, ResourceKind, Snapshot,
     VolumeRow,
@@ -72,7 +73,8 @@ impl DockerService {
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (resp_tx, resp_rx) = async_channel::unbounded();
 
-        runtime.spawn(actor(docker, cmd_rx, resp_tx));
+        runtime.spawn(actor(docker.clone(), cmd_rx, resp_tx.clone()));
+        runtime.spawn(event_loop(docker, resp_tx));
 
         Ok((
             Self {
@@ -289,5 +291,55 @@ async fn probe_one(host: &HostInfo) -> HostStatus {
         Ok(Ok(_)) => HostStatus::Connected,
         Ok(Err(err)) => status_from_error(&err),
         Err(_) => HostStatus::Unreachable("timed out after 300ms".to_string()),
+    }
+}
+
+
+/// Subscribes to `/events` and pushes debounced dirty notifications into the UI.
+/// The daemon restarting ends the stream; we mark the host unreachable and
+/// resubscribe with exponential backoff (1s doubling to a 10s cap).
+async fn event_loop(docker: Docker, resp_tx: Sender<Response>) {
+    let mut backoff_secs: u64 = 1;
+
+    loop {
+        let healthy = matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), docker.ping()).await,
+            Ok(Ok(_))
+        );
+        if healthy {
+            backoff_secs = 1;
+            let _ = resp_tx.try_send(Response::Status(HostStatus::Connected));
+        } else {
+            let _ = resp_tx.try_send(Response::Status(HostStatus::Unreachable(
+                "docker engine is not answering".to_string(),
+            )));
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(10);
+            continue;
+        }
+
+        let mut debouncer = Debouncer::new();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+        let mut stream = Box::pin(docker.events(None));
+
+        loop {
+            tokio::select! {
+                item = stream.next() => match item {
+                    Some(Ok(event)) => debouncer.record(&event, std::time::Instant::now()),
+                    Some(Err(_)) | None => break,
+                },
+                _ = ticker.tick() => {
+                    if let Some((kinds, ids)) = debouncer.take_if_due(std::time::Instant::now()) {
+                        let _ = resp_tx.try_send(Response::Dirty { kinds, ids });
+                    }
+                }
+            }
+        }
+
+        let _ = resp_tx.try_send(Response::Status(HostStatus::Unreachable(
+            "docker event stream ended".to_string(),
+        )));
+        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(10);
     }
 }
