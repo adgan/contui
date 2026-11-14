@@ -87,6 +87,17 @@ impl TableState {
         self.recompute();
     }
 
+    /// Carries the user's query, sort and selected row onto a freshly built
+    /// table, so a live snapshot never resets what they were looking at.
+    pub fn adopt_state(&mut self, previous: &TableState) {
+        self.query = previous.query.clone();
+        self.sort = previous.sort;
+        let selected_id = previous.selected_row().map(|row| row.id.clone());
+        self.recompute();
+        self.selected = selected_id
+            .and_then(|id| self.rows.iter().position(|row| row.id == id));
+    }
+
     pub fn click_header(&mut self, column: usize) {
         self.sort = match self.sort {
             Some((col, true)) if col == column => Some((column, false)),
@@ -100,6 +111,12 @@ impl TableState {
         &self.cached
     }
 
+    /// Position of the selected row inside the visible list, for scrolling.
+    pub fn selection_position(&self) -> Option<usize> {
+        let selected = self.selected?;
+        self.cached.iter().position(|&ix| ix == selected)
+    }
+
     pub fn selected_row(&self) -> Option<&TableRow> {
         self.selected.and_then(|ix| self.rows.get(ix))
     }
@@ -109,9 +126,18 @@ impl TableState {
             self.selected = None;
             return;
         }
+        let Some(selected) = self.selected else {
+            self.selected = if delta >= 0 {
+                self.cached.first().copied()
+            } else {
+                self.cached.last().copied()
+            };
+            return;
+        };
         let current_position = self
-            .selected
-            .and_then(|sel| self.cached.iter().position(|&ix| ix == sel))
+            .cached
+            .iter()
+            .position(|&ix| ix == selected)
             .unwrap_or(0);
         let next = (current_position as isize + delta)
             .clamp(0, self.cached.len() as isize - 1) as usize;
@@ -277,6 +303,59 @@ mod tests {
         let first = t.visible().as_ptr();
         let second = t.visible().as_ptr();
         assert_eq!(first, second, "visible() must not recompute");
+    }
+
+    #[test]
+    fn move_selection_starts_at_first_row_when_nothing_selected() {
+        let mut t = TableState::new(spec());
+        t.set_rows(
+            (0..3)
+                .map(|i| row(&i.to_string(), &format!("c{i}"), "img"))
+                .collect(),
+        );
+        t.move_selection(1);
+        assert_eq!(t.selected, Some(0), "first Down must land on row 0");
+    }
+
+    #[test]
+    fn move_selection_up_from_nothing_selects_the_last_row() {
+        let mut t = TableState::new(spec());
+        t.set_rows(
+            (0..3)
+                .map(|i| row(&i.to_string(), &format!("c{i}"), "img"))
+                .collect(),
+        );
+        t.move_selection(-1);
+        assert_eq!(t.selected, Some(2));
+    }
+
+    #[test]
+    fn adopt_state_keeps_query_sort_and_selection() {
+        let mut previous = TableState::new(spec());
+        previous.set_rows(vec![
+            row("a", "alpha", "img"),
+            row("b", "beta", "img"),
+            row("c", "gamma", "img"),
+        ]);
+        previous.set_query("alph");
+        previous.click_header(0);
+        previous.selected = Some(0);
+
+        let mut fresh = TableState::new(spec());
+        fresh.set_rows(vec![
+            row("c", "gamma", "img"),
+            row("a", "alpha", "img"),
+            row("b", "beta", "img"),
+        ]);
+        fresh.adopt_state(&previous);
+
+        assert_eq!(fresh.query, "alph");
+        assert_eq!(fresh.sort, Some((0, true)));
+        assert_eq!(
+            fresh.selected.map(|ix| fresh.rows[ix].id.clone()),
+            Some("a".to_string())
+        );
+        assert_eq!(fresh.visible().len(), 1);
     }
 
     #[test]

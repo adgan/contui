@@ -3,7 +3,9 @@ use gpui::{
     App, Application, Bounds, KeyBinding, Menu, MenuItem, WindowBounds, WindowOptions, px, size,
 };
 
-use crate::actions::{Back, FocusSearch, Refresh, ShowContainers, ShowImages, ShowVolumes};
+use crate::actions::{
+    Back, FocusSearch, Quit, Refresh, ShowContainers, ShowImages, ShowVolumes,
+};
 
 pub mod actions;
 pub mod assets;
@@ -37,9 +39,17 @@ pub fn run() {
             KeyBinding::new("cmd-r", Refresh, None),
             KeyBinding::new("cmd-f", FocusSearch, None),
             KeyBinding::new("escape", Back, None),
+            KeyBinding::new("cmd-q", Quit, None),
         ]);
-        cx.set_menus(vec![Menu {
-            name: "View".into(),
+        cx.set_menus(vec![
+            Menu {
+                name: "Dockyard".into(),
+                items: vec![
+                    MenuItem::action("Quit Dockyard", Quit),
+                ],
+            },
+            Menu {
+                name: "View".into(),
             items: vec![
                 MenuItem::action("Containers", ShowContainers),
                 MenuItem::action("Images", ShowImages),
@@ -48,12 +58,14 @@ pub fn run() {
                 MenuItem::action("Refresh", Refresh),
                 MenuItem::action("Search", FocusSearch),
             ],
-        }]);
+        },
+        ]);
 
         let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(960.), px(600.))),
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("Dockyard".into()),
                     appears_transparent: false,

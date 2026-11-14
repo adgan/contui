@@ -145,6 +145,34 @@ fn status_for(endpoint: &Endpoint) -> HostStatus {
     }
 }
 
+/// `DOCKER_CERT_PATH` is how the CLI is pointed at client certificates. When
+/// all three files are present, a tcp host is spoken to over TLS.
+fn apply_env_tls(
+    endpoint: Endpoint,
+    env: &HashMap<String, String>,
+) -> (Endpoint, Option<TlsFiles>) {
+    let Some(cert_path) = env.get("DOCKER_CERT_PATH").filter(|p| !p.is_empty()) else {
+        return (endpoint, None);
+    };
+    if endpoint.kind != EndpointKind::Http {
+        return (endpoint, None);
+    }
+    let dir = PathBuf::from(cert_path);
+    let ca = dir.join("ca.pem");
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    if !(ca.exists() && cert.exists() && key.exists()) {
+        return (endpoint, None);
+    }
+    (
+        Endpoint {
+            kind: EndpointKind::Tls,
+            address: endpoint.address,
+        },
+        Some(TlsFiles { key, cert, ca }),
+    )
+}
+
 fn read_contexts(home: &Path) -> Vec<HostInfo> {
     let mut out = Vec::new();
     let meta_root = home.join(".docker/contexts/meta");
@@ -219,6 +247,7 @@ pub fn discover(env: &HashMap<String, String>, home: &Path) -> Discovery {
             let id = format!("env:{}", strip_scheme(raw));
             let detail = raw.to_string();
             let name = socket_app_name(Path::new(strip_scheme(raw)));
+            let (endpoint, tls) = apply_env_tls(endpoint, env);
             hosts.insert(
                 0,
                 HostInfo {
@@ -227,7 +256,7 @@ pub fn discover(env: &HashMap<String, String>, home: &Path) -> Discovery {
                     detail,
                     status: status_for(&endpoint),
                     endpoint,
-                    tls: None,
+                    tls,
                 },
             );
         }
@@ -395,6 +424,30 @@ mod tests {
         let d = discover(&HashMap::new(), dir.path());
         assert_eq!(d.hosts.len(), 1);
         assert_eq!(d.hosts[0].name, "rancher-desktop");
+    }
+
+    #[test]
+    fn docker_cert_path_turns_a_tcp_host_into_a_tls_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let certs = dir.path().join("certs");
+        std::fs::create_dir_all(&certs).unwrap();
+        for name in ["ca.pem", "cert.pem", "key.pem"] {
+            std::fs::write(certs.join(name), "x").unwrap();
+        }
+        let env = HashMap::from([
+            (
+                "DOCKER_HOST".to_string(),
+                "tcp://10.0.0.5:2376".to_string(),
+            ),
+            (
+                "DOCKER_CERT_PATH".to_string(),
+                certs.to_string_lossy().to_string(),
+            ),
+        ]);
+        let d = discover(&env, Path::new("/nonexistent"));
+        assert_eq!(d.hosts[0].endpoint.kind, EndpointKind::Tls);
+        let tls = d.hosts[0].tls.as_ref().expect("tls files");
+        assert_eq!(tls.ca, certs.join("ca.pem"));
     }
 
     #[test]

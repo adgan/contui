@@ -147,6 +147,7 @@ impl Snapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogLine {
     pub stderr: bool,
+    pub timestamp: Option<String>,
     pub text: String,
 }
 
@@ -264,13 +265,26 @@ pub fn parse_logs(chunks: &[LogOutput]) -> Vec<LogLine> {
             parts.pop();
         }
         for part in parts {
+            let (timestamp, text) = split_timestamp(part);
             lines.push(LogLine {
                 stderr,
-                text: part.to_string(),
+                timestamp,
+                text: text.to_string(),
             });
         }
     }
     lines
+}
+
+/// Docker prefixes each line with an RFC3339 stamp when `timestamps(true)` is
+/// requested; peel it off so the renderer can dim it separately.
+fn split_timestamp(line: &str) -> (Option<String>, &str) {
+    if let Some((first, rest)) = line.split_once(' ') {
+        if first.len() >= 20 && first.contains('T') && first.ends_with('Z') {
+            return (Some(first.to_string()), rest);
+        }
+    }
+    (None, line)
 }
 
 pub fn status_from_error(error: &bollard::errors::Error) -> HostStatus {
@@ -405,6 +419,28 @@ mod tests {
         assert_eq!(lines[0].text, "boom");
         assert!(!lines[1].stderr);
         assert!(lines[1].text.ends_with(" hi"));
+    }
+
+    #[test]
+    fn splits_docker_timestamps_from_log_text() {
+        let chunks = vec![LogOutput::StdOut {
+            message: b"2026-11-14T21:00:00.123456789Z hello world\n".as_slice().into(),
+        }];
+        let lines = parse_logs(&chunks);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].timestamp.as_deref(),
+            Some("2026-11-14T21:00:00.123456789Z")
+        );
+        assert_eq!(lines[0].text, "hello world");
+    }
+
+    #[test]
+    fn plain_log_lines_have_no_timestamp() {
+        let chunks = vec![LogOutput::StdOut {
+            message: b"no timestamp here\n".as_slice().into(),
+        }];
+        assert!(parse_logs(&chunks)[0].timestamp.is_none());
     }
 
     #[test]

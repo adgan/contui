@@ -59,6 +59,60 @@ impl Page {
     }
 }
 
+/// Order of operations when the user presses Esc: a filter is the most local
+/// thing to clear, then the detail page, then the whole list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscapeAction {
+    ClearQuery,
+    Back,
+}
+
+pub fn escape_action(query: &str) -> EscapeAction {
+    if query.is_empty() {
+        EscapeAction::Back
+    } else {
+        EscapeAction::ClearQuery
+    }
+}
+
+pub fn is_stale(fetched_at: Option<chrono::DateTime<Utc>>, now: chrono::DateTime<Utc>) -> bool {
+    fetched_at
+        .map(|fetched| (now - fetched).num_seconds() > STALE_AFTER_SECS)
+        .unwrap_or(true)
+}
+
+/// A reconnect is only useful if we refetch: events that happened while the
+/// engine was down were never delivered.
+pub fn should_refetch_on_status(previous: &HostStatus, next: &HostStatus) -> bool {
+    !matches!(previous, HostStatus::Connected) && matches!(next, HostStatus::Connected)
+}
+
+pub fn tables_from(snapshot: &Snapshot, previous: &[TableState; 3]) -> [TableState; 3] {
+    let mut next = [
+        RootView::containers_table(snapshot),
+        RootView::images_table(snapshot),
+        RootView::volumes_table(snapshot),
+    ];
+    for (fresh, old) in next.iter_mut().zip(previous.iter()) {
+        fresh.adopt_state(old);
+    }
+    next
+}
+
+fn reset_host_data(
+    snapshot: &mut Snapshot,
+    tables: &mut [TableState; 3],
+    detail: &mut Option<DetailState>,
+) {
+    *snapshot = Snapshot::empty();
+    for table in tables.iter_mut() {
+        table.set_rows(Vec::new());
+        table.set_query("");
+        table.selected = None;
+    }
+    *detail = None;
+}
+
 pub struct RootView {
     pub page: Page,
     pub theme: Theme,
@@ -250,10 +304,16 @@ impl RootView {
     }
 
     fn connect(&mut self, host: HostInfo, cx: &mut Context<Self>) {
-        self.active_host = Some(host.id.clone());
+        let host_id = host.id.clone();
+        self.service = None;
+        self._pump = None;
+        self.host_menu_open = false;
+        reset_host_data(&mut self.snapshot, &mut self.tables, &mut self.detail);
+        self.last_error = None;
         self.status = HostStatus::Unknown;
         match DockerService::connect(host) {
             Ok((service, responses)) => {
+                self.active_host = Some(host_id.clone());
                 self.service = Some(service);
                 self.last_error = None;
                 let entity = cx.entity();
@@ -277,6 +337,7 @@ impl RootView {
                 }
             }
             Err(err) => {
+                self.active_host = Some(host_id);
                 self.last_error = Some(err.clone());
                 self.status = HostStatus::Unreachable(err);
             }
@@ -308,7 +369,15 @@ impl RootView {
                     }
                 }
             }
-            Response::Status(status) => self.status = status,
+            Response::Status(status) => {
+                if should_refetch_on_status(&self.status, &status) {
+                    self.status = status;
+                    self.last_error = None;
+                    self.refresh();
+                } else {
+                    self.status = status;
+                }
+            }
             Response::HostStatuses(statuses) => {
                 for (id, status) in statuses {
                     if let Some(host) = self.hosts.iter_mut().find(|h| h.id == id) {
@@ -341,7 +410,14 @@ impl RootView {
                 }
             }
             Response::Failed { what, message } => {
-                self.last_error = Some(format!("{what}: {message}"));
+                let owned = self
+                    .detail
+                    .as_mut()
+                    .map(|detail| detail.apply_failed(&what, &message))
+                    .unwrap_or(false);
+                if !owned {
+                    self.last_error = Some(format!("{what}: {message}"));
+                }
             }
             Response::Inspect { kind, id, json } => {
                 if let Some(detail) = &mut self.detail {
@@ -362,30 +438,13 @@ impl RootView {
     }
 
     fn rebuild_tables(&mut self) {
-        let selections: Vec<Option<String>> = self
-            .tables
-            .iter()
-            .map(|t| t.selected_row().map(|row| row.id.clone()))
-            .collect();
-
-        self.tables = [
-            Self::containers_table(&self.snapshot),
-            Self::images_table(&self.snapshot),
-            Self::volumes_table(&self.snapshot),
-        ];
-
-        for (table, selected_id) in self.tables.iter_mut().zip(selections) {
-            if let Some(id) = selected_id {
-                if let Some(ix) = table.rows.iter().position(|row| row.id == id) {
-                    table.selected = Some(ix);
-                }
-            }
-        }
+        self.tables = tables_from(&self.snapshot, &self.tables);
     }
 
     pub fn switch_page(&mut self, page: Page) {
         self.page = page;
         self.host_menu_open = false;
+        self.refresh_if_stale();
     }
 
     pub fn select_host(&mut self, host_id: &str, cx: &mut Context<Self>) {
@@ -403,6 +462,31 @@ impl RootView {
         }
     }
 
+    fn scroll_selection_into_view(&mut self, index: usize) {
+        let table = &self.tables[index];
+        if let Some(position) = table.selection_position() {
+            table.scroll.scroll_to_item(position, gpui::ScrollStrategy::Center);
+        }
+    }
+
+    fn request_detail_refresh(&mut self) {
+        let Some(detail) = self.detail.clone() else {
+            return;
+        };
+        let Some(service) = &self.service else {
+            return;
+        };
+        service.request(Request::Inspect {
+            kind: detail.kind,
+            id: detail.id.clone(),
+        });
+        if detail.logs_requested {
+            service.request(Request::Logs {
+                id: detail.id.clone(),
+            });
+        }
+    }
+
     fn refresh(&mut self) {
         if let Some(service) = &self.service {
             service.request(Request::FetchAll);
@@ -410,13 +494,27 @@ impl RootView {
     }
 
     fn refresh_if_stale(&mut self) {
-        let stale = self
-            .snapshot
-            .fetched_at
-            .map(|fetched| (Utc::now() - fetched).num_seconds() > STALE_AFTER_SECS)
-            .unwrap_or(true);
-        if stale {
+        if is_stale(self.snapshot.fetched_at, Utc::now()) {
             self.refresh();
+        }
+    }
+
+    /// Esc is bound to the `Back` action, which gpui dispatches before element
+    /// key handlers, so the query-clearing behaviour lives here.
+    fn go_back(&mut self) {
+        let query = self.current_table().query.clone();
+        match escape_action(&query) {
+            EscapeAction::ClearQuery => {
+                let table = self.current_table_mut();
+                table.set_query("");
+            }
+            EscapeAction::Back => {
+                if self.detail.is_some() {
+                    self.close_detail();
+                } else {
+                    self.host_menu_open = false;
+                }
+            }
         }
     }
 
@@ -476,13 +574,19 @@ impl RootView {
         }
         match key {
             "up" => {
-                let table = self.current_table_mut();
-                table.move_selection(-1);
+                let index = self.page.index();
+                self.tables[index].move_selection(-1);
+                self.scroll_selection_into_view(index);
                 cx.notify();
             }
             "down" => {
-                let table = self.current_table_mut();
-                table.move_selection(1);
+                let index = self.page.index();
+                self.tables[index].move_selection(1);
+                self.scroll_selection_into_view(index);
+                cx.notify();
+            }
+            "escape" => {
+                self.go_back();
                 cx.notify();
             }
             "enter" => {
@@ -553,6 +657,15 @@ impl RootView {
         self.detail = None;
     }
 
+    fn retry_detail(&mut self) {
+        if let Some(detail) = &mut self.detail {
+            detail.error = None;
+            detail.inspect = None;
+            detail.logs = None;
+        }
+        self.request_detail_refresh();
+    }
+
     fn select_tab(&mut self, tab: DetailTab) {
         let Some(detail) = &mut self.detail else {
             return;
@@ -617,7 +730,35 @@ impl RootView {
             None
         };
 
-        let body: gpui::AnyElement = if detail.missing {
+        let body: gpui::AnyElement = if let Some(error) = detail.error.clone() {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .px_8()
+                .text_center()
+                .child(div().text_sm().text_color(theme.error).child(error))
+                .child(
+                    div()
+                        .id("detail-retry")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .text_xs()
+                        .text_color(theme.text)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.hover))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.retry_detail();
+                            cx.notify();
+                        }))
+                        .child("Retry"),
+                )
+                .into_any_element()
+        } else if detail.missing {
             div()
                 .flex_1()
                 .flex()
@@ -687,6 +828,24 @@ impl RootView {
                             .child(back_label),
                     )
                     .child(div().text_base().child(detail.title.clone()))
+                    .when(detail.tab == DetailTab::Logs, |this| {
+                        this.child(
+                            div()
+                                .id("logs-refresh")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(theme.text_dim)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme.hover))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.request_detail_refresh();
+                                    cx.notify();
+                                }))
+                                .child("Reload"),
+                        )
+                    })
                     .when_some(status, |this, status| {
                         this.child(
                             div()
@@ -989,6 +1148,7 @@ impl RootView {
             );
         }
 
+        let scroll_handle = self.tables[index].scroll.clone();
         let list = uniform_list(
             self.tables[index].spec.id,
             visible_count,
@@ -1038,6 +1198,7 @@ impl RootView {
                 rows
             }),
         )
+        .track_scroll(scroll_handle)
         .h_full();
 
         let body: gpui::AnyElement = if visible_count == 0 {
@@ -1264,12 +1425,11 @@ impl Render for RootView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &crate::actions::Back, _window, cx| {
-                if this.detail.is_some() {
-                    this.close_detail();
-                } else {
-                    this.host_menu_open = false;
-                }
+                this.go_back();
                 cx.notify();
+            }))
+            .on_action(cx.listener(|_, _: &crate::actions::Quit, _window, cx| {
+                cx.quit();
             }));
 
         root = root.child(rail).child(content);
@@ -1380,6 +1540,91 @@ mod tests {
             vec!["Name", "Driver", "Mountpoint", "Created"]
         );
         assert_eq!(table.rows.len(), 1);
+    }
+
+    #[test]
+    fn rebuilding_tables_keeps_query_sort_and_selection() {
+        let snapshot = Snapshot {
+            containers: vec![
+                container("alpha", ContainerState::Running),
+                container("beta", ContainerState::Exited),
+            ],
+            ..Snapshot::empty()
+        };
+        let mut previous = [
+            RootView::containers_table(&snapshot),
+            RootView::images_table(&snapshot),
+            RootView::volumes_table(&snapshot),
+        ];
+        previous[0].set_query("alpha");
+        previous[0].click_header(0);
+        previous[0].selected = Some(0);
+
+        let next = tables_from(&snapshot, &previous);
+        assert_eq!(next[0].query, "alpha");
+        assert_eq!(next[0].sort, Some((0, true)));
+        assert!(next[0].visible().len() <= 1);
+    }
+
+    #[test]
+    fn reconnect_from_disconnected_refetches() {
+        assert!(should_refetch_on_status(
+            &HostStatus::Unreachable("gone".into()),
+            &HostStatus::Connected
+        ));
+        assert!(should_refetch_on_status(
+            &HostStatus::Unknown,
+            &HostStatus::Connected
+        ));
+        assert!(!should_refetch_on_status(
+            &HostStatus::Connected,
+            &HostStatus::Connected
+        ));
+        assert!(!should_refetch_on_status(
+            &HostStatus::Connected,
+            &HostStatus::Unreachable("gone".into())
+        ));
+    }
+
+    #[test]
+    fn stale_after_five_seconds_or_with_no_snapshot() {
+        let now = now();
+        assert!(is_stale(None, now));
+        assert!(!is_stale(Some(now - chrono::Duration::seconds(2)), now));
+        assert!(is_stale(Some(now - chrono::Duration::seconds(9)), now));
+    }
+
+    #[test]
+    fn escape_clears_a_query_before_going_back() {
+        assert_eq!(escape_action("postg"), EscapeAction::ClearQuery);
+        assert_eq!(escape_action(""), EscapeAction::Back);
+    }
+
+    #[test]
+    fn host_switch_resets_rows_and_detail() {
+        let snapshot = Snapshot {
+            containers: vec![container("alpha", ContainerState::Running)],
+            ..Snapshot::empty()
+        };
+        let mut tables = [
+            RootView::containers_table(&snapshot),
+            RootView::images_table(&snapshot),
+            RootView::volumes_table(&snapshot),
+        ];
+        tables[0].set_query("alpha");
+        let mut snapshot = snapshot;
+        let mut detail = Some(DetailState::new(
+            crate::docker::model::ResourceKind::Container,
+            "alpha-id".into(),
+            "alpha".into(),
+        ));
+
+        reset_host_data(&mut snapshot, &mut tables, &mut detail);
+
+        assert!(snapshot.containers.is_empty());
+        assert!(tables[0].rows.is_empty());
+        assert_eq!(tables[0].query, "");
+        assert!(detail.is_none());
     }
 
     #[test]

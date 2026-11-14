@@ -256,6 +256,7 @@ async fn fetch_logs(docker: &Docker, id: &str) -> Result<Vec<LogLine>, bollard::
         .stdout(true)
         .stderr(true)
         .tail("500")
+        .timestamps(true)
         .build();
     let mut stream = docker.logs(id, Some(options));
     let mut chunks = Vec::new();
@@ -283,6 +284,12 @@ async fn probe_hosts() -> Vec<(String, HostStatus)> {
     futures_util::future::join_all(futures).await
 }
 
+/// One mapping for every liveness check, so the event loop cannot downgrade an
+/// auth failure into a generic "not answering".
+fn liveness_status(error: &bollard::errors::Error) -> HostStatus {
+    status_from_error(error)
+}
+
 async fn probe_one(host: &HostInfo) -> HostStatus {
     let Ok(docker) = build_docker(host) else {
         return host.status.clone();
@@ -302,20 +309,25 @@ async fn event_loop(docker: Docker, resp_tx: Sender<Response>) {
     let mut backoff_secs: u64 = 1;
 
     loop {
-        let healthy = matches!(
-            tokio::time::timeout(std::time::Duration::from_secs(3), docker.ping()).await,
-            Ok(Ok(_))
-        );
-        if healthy {
-            backoff_secs = 1;
-            let _ = resp_tx.try_send(Response::Status(HostStatus::Connected));
-        } else {
-            let _ = resp_tx.try_send(Response::Status(HostStatus::Unreachable(
-                "docker engine is not answering".to_string(),
-            )));
-            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-            backoff_secs = (backoff_secs * 2).min(10);
-            continue;
+        match tokio::time::timeout(std::time::Duration::from_secs(3), docker.ping()).await {
+            Ok(Ok(_)) => {
+                backoff_secs = 1;
+                let _ = resp_tx.try_send(Response::Status(HostStatus::Connected));
+            }
+            Ok(Err(err)) => {
+                let _ = resp_tx.try_send(Response::Status(liveness_status(&err)));
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(10);
+                continue;
+            }
+            Err(_) => {
+                let _ = resp_tx.try_send(Response::Status(HostStatus::Unreachable(
+                    "no answer within 3s".to_string(),
+                )));
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(10);
+                continue;
+            }
         }
 
         let mut debouncer = Debouncer::new();
@@ -341,5 +353,24 @@ async fn event_loop(docker: Docker, resp_tx: Sender<Response>) {
         )));
         tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(10);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn liveness_failure_keeps_auth_failed_and_the_reason() {
+        let forbidden = bollard::errors::Error::DockerResponseServerError {
+            status_code: 403,
+            message: "permission denied while trying to connect".into(),
+        };
+        match liveness_status(&forbidden) {
+            HostStatus::AuthFailed(reason) => {
+                assert!(reason.contains("permission denied"), "got {reason}")
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
     }
 }
