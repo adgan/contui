@@ -1,5 +1,5 @@
-use dockyard::docker::endpoint::discover;
-use dockyard::docker::service::{DockerService, Request, Response};
+use contui::docker::endpoint::discover;
+use contui::docker::service::{DockerService, Request, Response};
 use std::collections::HashMap;
 use std::path::PathBuf;
 

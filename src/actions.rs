@@ -1,6 +1,6 @@
 use gpui::actions;
 
 actions!(
-    dockyard,
+    contui,
     [ShowContainers, ShowImages, ShowVolumes, Refresh, FocusSearch, Back, Quit]
 );

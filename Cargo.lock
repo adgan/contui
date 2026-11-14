@@ -850,6 +850,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be95d4a884358a21a199689323c29e9256b4a1b315e22f183d155422041d3a9a"
 
 [[package]]
+name = "contui"
+version = "0.1.0"
+dependencies = [
+ "async-channel 2.5.0",
+ "bollard",
+ "chrono",
+ "futures-util",
+ "gpui",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1179,23 +1196,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
  "libloading",
-]
-
-[[package]]
-name = "dockyard"
-version = "0.1.0"
-dependencies = [
- "async-channel 2.5.0",
- "bollard",
- "chrono",
- "futures-util",
- "gpui",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
 ]
 
 [[package]]

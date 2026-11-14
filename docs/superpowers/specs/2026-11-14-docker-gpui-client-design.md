@@ -14,7 +14,7 @@ The app navigates the way Docker Desktop does: an icon rail on the left, a table
 resource, clicking a row drills into a detail page with tabs, and a back arrow returns.
 
 The product name is **contUI** (binary `contui`), settled 2026-11-14; it began as the
-working name Dockyard and was renamed before any code was written.
+working name Dockyard and was renamed to contUI once the first implementation existed.
 
 ## Why now
 
