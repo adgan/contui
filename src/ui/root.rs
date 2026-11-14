@@ -5,7 +5,7 @@ use crate::theme::Theme;
 use crate::docker::model::ResourceKind;
 use crate::ui::detail::{render_logs, DetailState, DetailTab};
 use crate::ui::inspect::{build_tree, InspectNode};
-use crate::ui::table::{ColumnWidth, SortValue, TableRow, TableSpec, TableState};
+use crate::ui::table::{ActionsColumn, ColumnWidth, SortValue, TableRow, TableSpec, TableState};
 use chrono::Utc;
 use gpui::prelude::*;
 use gpui::{
@@ -181,6 +181,7 @@ impl RootView {
                 ColumnWidth::Fixed(120.0),
                 ColumnWidth::Fixed(96.0),
             ],
+            actions: Some(ActionsColumn::Container),
         };
 
         let mut sorted: Vec<&crate::docker::model::ContainerRow> =
@@ -231,6 +232,7 @@ impl RootView {
                 ColumnWidth::Fixed(96.0),
                 ColumnWidth::Fixed(72.0),
             ],
+            actions: Some(ActionsColumn::Image),
         };
 
         let mut sorted: Vec<&crate::docker::model::ImageRow> = snapshot.images.iter().collect();
@@ -273,6 +275,7 @@ impl RootView {
                 ColumnWidth::Flex(3.0),
                 ColumnWidth::Fixed(96.0),
             ],
+            actions: Some(ActionsColumn::Volume),
         };
 
         let mut sorted: Vec<&crate::docker::model::VolumeRow> = snapshot.volumes.iter().collect();
@@ -1482,6 +1485,7 @@ mod tests {
             created: now(),
             created_label: SharedString::from("2m ago"),
             in_use,
+            tag_count: 1,
         }
     }
 
@@ -1492,6 +1496,26 @@ mod tests {
             mountpoint: SharedString::from("/var/lib/docker/volumes/x/_data"),
             created_label: SharedString::from("2m ago"),
         }
+    }
+
+    #[test]
+    fn each_table_declares_its_action_column() {
+        let snapshot = Snapshot::empty();
+        assert_eq!(
+            RootView::containers_table(&snapshot).spec.actions,
+            Some(ActionsColumn::Container)
+        );
+        assert_eq!(
+            RootView::images_table(&snapshot).spec.actions,
+            Some(ActionsColumn::Image)
+        );
+        assert_eq!(
+            RootView::volumes_table(&snapshot).spec.actions,
+            Some(ActionsColumn::Volume)
+        );
+        assert_eq!(ActionsColumn::Container.width(), 124.0);
+        assert_eq!(ActionsColumn::Image.width(), 84.0);
+        assert_eq!(ActionsColumn::Volume.width(), 44.0);
     }
 
     #[test]

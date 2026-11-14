@@ -78,10 +78,12 @@ pub struct ImageRow {
     pub created: DateTime<Utc>,
     pub created_label: SharedString,
     pub in_use: bool,
+    pub tag_count: usize,
 }
 
 impl ImageRow {
     pub fn from_summary(image: ImageSummary, in_use: bool, now: DateTime<Utc>) -> Self {
+        let tag_count = image.repo_tags.len();
         let repository_tag = image
             .repo_tags
             .first()
@@ -103,6 +105,7 @@ impl ImageRow {
             created,
             created_label: format_ago(created, now).into(),
             in_use,
+            tag_count,
         }
     }
 }
@@ -356,6 +359,24 @@ mod tests {
             container_state(ContainerSummaryStateEnum::EMPTY),
             ContainerState::Unknown
         );
+    }
+
+    #[test]
+    fn image_row_counts_every_tag() {
+        let summary = bollard::models::ImageSummary {
+            id: "sha256:abc".into(),
+            repo_tags: vec!["postgres:18".into(), "postgres:latest".into()],
+            created: 1_699_999_880,
+            size: 1,
+            ..Default::default()
+        };
+        let row = ImageRow::from_summary(
+            summary,
+            false,
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        );
+        assert_eq!(row.tag_count, 2);
+        assert_eq!(row.repository_tag.as_ref(), "postgres:18");
     }
 
     #[test]
