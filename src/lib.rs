@@ -5,6 +5,7 @@ use gpui::{
 
 pub mod docker;
 pub mod theme;
+pub mod ui;
 
 use theme::Theme;
 
