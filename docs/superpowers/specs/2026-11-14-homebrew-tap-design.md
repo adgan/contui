@@ -97,8 +97,8 @@ adgan/homebrew-tap
 
 - `desc`, `homepage` (`adgan/contui`), `license "MIT"`, `version "0.1.0"` (documentation
   only until a stable url exists).
-- `head "https://github.com/adgan/contui.git", branch: "feat/contui"` while the rename
-  branch is unmerged; the release checklist flips it to `branch: "main"`.
+- `head "https://github.com/adgan/contui.git", branch: "main"` (pinned to `feat/contui`
+  only while the rename was unmerged).
 - `depends_on "rust" => :build`, `depends_on :macos`.
 - `install`: `cargo install *std_cargo_args` (Homebrew rejects `cargo build`), move
   `prefix/bin/contui` into `contUI.app/Contents/MacOS/contUI`, `prefix.install
