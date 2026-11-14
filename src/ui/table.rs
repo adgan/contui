@@ -1,5 +1,31 @@
+use crate::docker::model::ResourceKind;
 use chrono::{DateTime, Utc};
 use gpui::{Rgba, SharedString, UniformListScrollHandle};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionsColumn {
+    Container,
+    Image,
+    Volume,
+}
+
+impl ActionsColumn {
+    pub fn width(self) -> f32 {
+        match self {
+            ActionsColumn::Container => 124.0,
+            ActionsColumn::Image => 84.0,
+            ActionsColumn::Volume => 44.0,
+        }
+    }
+
+    pub fn kind(self) -> ResourceKind {
+        match self {
+            ActionsColumn::Container => ResourceKind::Container,
+            ActionsColumn::Image => ResourceKind::Image,
+            ActionsColumn::Volume => ResourceKind::Volume,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ColumnWidth {
@@ -12,6 +38,7 @@ pub struct TableSpec {
     pub id: &'static str,
     pub columns: Vec<&'static str>,
     pub widths: Vec<ColumnWidth>,
+    pub actions: Option<ActionsColumn>,
 }
 
 #[derive(Clone, Debug)]
@@ -184,7 +211,16 @@ mod tests {
             id: "t",
             columns: vec!["Name", "Image"],
             widths: vec![ColumnWidth::Flex(1.0), ColumnWidth::Flex(1.0)],
+            actions: None,
         }
+    }
+
+    #[test]
+    fn action_columns_are_not_data_cells() {
+        let mut s = spec();
+        s.actions = Some(ActionsColumn::Container);
+        assert_eq!(s.columns.len(), 2);
+        assert!(s.actions.is_some());
     }
 
     fn row(id: &str, name: &str, image: &str) -> TableRow {
@@ -364,6 +400,7 @@ mod tests {
             id: "t",
             columns: vec!["A", "B"],
             widths: vec![ColumnWidth::Fixed(80.0), ColumnWidth::Flex(1.0)],
+            actions: None,
         };
         assert_eq!(s.columns.len(), s.widths.len());
     }

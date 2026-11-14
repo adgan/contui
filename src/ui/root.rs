@@ -1,18 +1,22 @@
+use crate::docker::actions::{
+    build_run_spec, container_actions, ActionKind, ContainerAction, Proto, RunField, RunForm, Target,
+};
 use crate::docker::endpoint::{discover, HostInfo, HostStatus};
-use crate::docker::model::{ContainerState, Snapshot};
-use crate::docker::service::{DockerService, Request, Response};
+use crate::docker::model::{format_bytes, ContainerState, Snapshot};
+use crate::docker::service::{DockerService, PullOrigin, Request, Response};
 use crate::theme::Theme;
 use crate::docker::model::ResourceKind;
 use crate::ui::detail::{render_logs, DetailState, DetailTab};
 use crate::ui::inspect::{build_tree, InspectNode};
-use crate::ui::table::{ColumnWidth, SortValue, TableRow, TableSpec, TableState};
+use crate::ui::mutations::{Mutations, PullState, RowMenuState, RunOutcome, RunState, Toast};
+use crate::ui::table::{ActionsColumn, ColumnWidth, SortValue, TableRow, TableSpec, TableState};
 use chrono::Utc;
 use gpui::prelude::*;
 use gpui::{
-    Context, Div, FocusHandle, KeyDownEvent, Render, SharedString, Subscription, Task, Window, div,
-    px, uniform_list,
+    AnyElement, Context, Div, FocusHandle, KeyDownEvent, MouseButton, Render, SharedString,
+    Subscription, Task, Window, div, px, svg, uniform_list,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 const STALE_AFTER_SECS: i64 = 5;
@@ -123,10 +127,13 @@ pub struct RootView {
     pub active_host: Option<String>,
     pub tables: [TableState; 3],
     pub last_error: Option<String>,
+    pub mutations: Mutations,
     pub host_menu_open: bool,
     pub detail: Option<DetailState>,
     search_focus: FocusHandle,
     root_focus: FocusHandle,
+    pull_focus: FocusHandle,
+    run_focus: Option<crate::ui::dialog::RunFocus>,
     focus_initialized: bool,
     activation: Option<Subscription>,
     _pump: Option<Task<()>>,
@@ -152,10 +159,13 @@ impl RootView {
                 Self::volumes_table(&Snapshot::empty()),
             ],
             last_error: None,
+            mutations: Mutations::new(),
             host_menu_open: false,
             detail: None,
             search_focus: cx.focus_handle(),
             root_focus: cx.focus_handle(),
+            pull_focus: cx.focus_handle(),
+            run_focus: None,
             focus_initialized: false,
             activation: None,
             _pump: None,
@@ -181,6 +191,7 @@ impl RootView {
                 ColumnWidth::Fixed(120.0),
                 ColumnWidth::Fixed(96.0),
             ],
+            actions: Some(ActionsColumn::Container),
         };
 
         let mut sorted: Vec<&crate::docker::model::ContainerRow> =
@@ -231,6 +242,7 @@ impl RootView {
                 ColumnWidth::Fixed(96.0),
                 ColumnWidth::Fixed(72.0),
             ],
+            actions: Some(ActionsColumn::Image),
         };
 
         let mut sorted: Vec<&crate::docker::model::ImageRow> = snapshot.images.iter().collect();
@@ -273,6 +285,7 @@ impl RootView {
                 ColumnWidth::Flex(3.0),
                 ColumnWidth::Fixed(96.0),
             ],
+            actions: Some(ActionsColumn::Volume),
         };
 
         let mut sorted: Vec<&crate::docker::model::VolumeRow> = snapshot.volumes.iter().collect();
@@ -309,6 +322,8 @@ impl RootView {
         self._pump = None;
         self.host_menu_open = false;
         reset_host_data(&mut self.snapshot, &mut self.tables, &mut self.detail);
+        self.mutations = Mutations::new();
+        self.run_focus = None;
         self.last_error = None;
         self.status = HostStatus::Unknown;
         match DockerService::connect(host) {
@@ -350,6 +365,18 @@ impl RootView {
                 self.snapshot = snapshot;
                 self.rebuild_tables();
                 self.last_error = None;
+                if let Some(id) = self.mutations.pending_select.take() {
+                    let page_index = Page::Containers.index();
+                    if let Some(row_index) = self.tables[page_index]
+                        .rows
+                        .iter()
+                        .position(|row| row.id == id)
+                    {
+                        self.page = Page::Containers;
+                        self.tables[page_index].selected = Some(row_index);
+                        self.open_detail(row_index);
+                    }
+                }
                 if let Some(detail) = &mut self.detail {
                     let present = match detail.kind {
                         ResourceKind::Container => {
@@ -370,12 +397,24 @@ impl RootView {
                 }
             }
             Response::Status(status) => {
+                let had_work = self.mutations.has_in_flight();
                 if should_refetch_on_status(&self.status, &status) {
                     self.status = status;
                     self.last_error = None;
                     self.refresh();
                 } else {
                     self.status = status;
+                }
+                if !matches!(self.status, HostStatus::Connected) && had_work {
+                    self.mutations.clear_in_flight();
+                    self.mutations.confirm = None;
+                    self.mutations.run = None;
+                    self.run_focus = None;
+                    self.mutations.row_menu = None;
+                    self.mutations.toast = Some(Toast {
+                        text: "Host disconnected — action interrupted".to_string(),
+                        error: true,
+                    });
                 }
             }
             Response::HostStatuses(statuses) => {
@@ -434,6 +473,78 @@ impl RootView {
                     }
                 }
             }
+            Response::ActionDone {
+                target,
+                action,
+                epoch,
+                error,
+            } => {
+                let outcome = self
+                    .mutations
+                    .apply_action_done(target.clone(), action, epoch, error);
+                if outcome.close_detail {
+                    let open = self.detail.as_ref().map(|detail| (detail.kind, detail.id.clone()));
+                    if open == Some((target.kind, target.id)) {
+                        self.close_detail();
+                    }
+                }
+                if let Some(toast) = outcome.toast {
+                    self.mutations.toast = Some(toast);
+                }
+                if outcome.refetch {
+                    self.refresh();
+                }
+            }
+            Response::PullProgress {
+                origin,
+                reference,
+                epoch,
+                layer,
+                status,
+                detail,
+            } => {
+                let _ = self.mutations.apply_pull_progress(
+                    origin, &reference, epoch, layer, status, detail,
+                );
+            }
+            Response::PullDone {
+                origin,
+                reference,
+                epoch,
+                error,
+            } => {
+                let outcome = self
+                    .mutations
+                    .apply_pull_done(origin, &reference, epoch, error);
+                if outcome.retry_run {
+                    self.retry_run_after_pull();
+                }
+                if let Some(toast) = outcome.toast {
+                    self.mutations.toast = Some(toast);
+                }
+                if outcome.refetch {
+                    self.refresh();
+                }
+            }
+            Response::ContainerCreated {
+                id,
+                warnings,
+                epoch,
+            } => {
+                let outcome = self.mutations.apply_run_created(id, warnings, epoch);
+                self.apply_run_outcome(outcome);
+            }
+            Response::RunFailed {
+                message,
+                missing_image,
+                created,
+                epoch,
+            } => {
+                let outcome =
+                    self.mutations
+                        .apply_run_failed(message, missing_image, created, epoch);
+                self.apply_run_outcome(outcome);
+            }
         }
     }
 
@@ -444,6 +555,7 @@ impl RootView {
     pub fn switch_page(&mut self, page: Page) {
         self.page = page;
         self.host_menu_open = false;
+        self.mutations.pull_open = false;
         self.refresh_if_stale();
     }
 
@@ -502,6 +614,29 @@ impl RootView {
     /// Esc is bound to the `Back` action, which gpui dispatches before element
     /// key handlers, so the query-clearing behaviour lives here.
     fn go_back(&mut self) {
+        if let Some(confirm) = &self.mutations.confirm {
+            if !confirm.submitting {
+                self.cancel_confirm();
+            }
+            return;
+        }
+        if let Some(run) = &self.mutations.run {
+            if !run.submitting {
+                self.cancel_run();
+            }
+            return;
+        }
+        if self.mutations.row_menu.take().is_some() {
+            return;
+        }
+        if self.mutations.pull_open {
+            self.mutations.pull_open = false;
+            return;
+        }
+        if self.host_menu_open {
+            self.host_menu_open = false;
+            return;
+        }
         let query = self.current_table().query.clone();
         match escape_action(&query) {
             EscapeAction::ClearQuery => {
@@ -657,6 +792,398 @@ impl RootView {
         self.detail = None;
     }
 
+    fn open_detail_by_id(&mut self, kind: ResourceKind, id: &str) {
+        let page = match kind {
+            ResourceKind::Container => Page::Containers,
+            ResourceKind::Image => Page::Images,
+            ResourceKind::Volume => Page::Volumes,
+        };
+        let row_index = self.tables[page.index()]
+            .rows
+            .iter()
+            .position(|row| row.id == id);
+        if let Some(row_index) = row_index {
+            self.page = page;
+            self.tables[page.index()].selected = Some(row_index);
+            self.open_detail(row_index);
+        }
+    }
+
+    fn request_action(&mut self, kind: ResourceKind, id: &str, title: &str, action: ActionKind) {
+        if action == ActionKind::Remove {
+            let tag_count = if kind == ResourceKind::Image {
+                self.snapshot
+                    .images
+                    .iter()
+                    .find(|image| image.id == id)
+                    .map(|image| image.tag_count)
+                    .unwrap_or(1)
+            } else {
+                0
+            };
+            self.mutations.open_confirm(
+                Target {
+                    kind,
+                    id: id.to_string(),
+                },
+                title.to_string(),
+                tag_count,
+            );
+            return;
+        }
+
+        if kind != ResourceKind::Container {
+            return;
+        }
+        if self.service.is_none() {
+            self.mutations.toast = Some(Toast {
+                text: "No host connection".to_string(),
+                error: true,
+            });
+            return;
+        }
+        let container_action = match action {
+            ActionKind::Start => ContainerAction::Start,
+            ActionKind::Stop => ContainerAction::Stop,
+            ActionKind::Restart => ContainerAction::Restart,
+            ActionKind::Remove => return,
+        };
+        let target = Target {
+            kind,
+            id: id.to_string(),
+        };
+        if !self.mutations.begin(&target, action) {
+            return;
+        }
+        if let Some(service) = &self.service {
+            service.request(Request::ContainerAction {
+                id: id.to_string(),
+                action: container_action,
+                epoch: self.mutations.epoch,
+            });
+        }
+    }
+
+    pub(crate) fn cancel_confirm(&mut self) {
+        let Some(confirm) = &self.mutations.confirm else {
+            return;
+        };
+        if confirm.submitting {
+            return;
+        }
+        self.mutations.confirm = None;
+    }
+
+    pub(crate) fn submit_confirm(&mut self) {
+        let Some(confirm) = self.mutations.confirm.as_mut() else {
+            return;
+        };
+        if confirm.submitting {
+            return;
+        }
+        if self.service.is_none() {
+            confirm.error = Some("No host connection".to_string());
+            return;
+        }
+        let kind = confirm.kind;
+        let id = confirm.id.clone();
+        let force = confirm.force;
+        let epoch = self.mutations.epoch;
+        confirm.submitting = true;
+        confirm.error = None;
+
+        let target = Target {
+            kind,
+            id: id.clone(),
+        };
+        if !self.mutations.begin(&target, ActionKind::Remove) {
+            if let Some(confirm) = &mut self.mutations.confirm {
+                confirm.submitting = false;
+                confirm.error = Some("An action is already running".to_string());
+            }
+            return;
+        }
+        if let Some(service) = &self.service {
+            match kind {
+                ResourceKind::Container => service.request(Request::RemoveContainer {
+                    id,
+                    force,
+                    epoch,
+                }),
+                ResourceKind::Image => service.request(Request::RemoveImage {
+                    id,
+                    force,
+                    epoch,
+                }),
+                ResourceKind::Volume => service.request(Request::RemoveVolume { name: id, epoch }),
+            }
+        }
+    }
+
+    fn render_action_buttons(
+        &mut self,
+        kind: ResourceKind,
+        id: &str,
+        title: &str,
+        state: Option<ContainerState>,
+        emphasized: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = self.theme.clone();
+        let pending = self
+            .mutations
+            .pending
+            .get(&(kind, id.to_string()))
+            .copied();
+        let actions: Vec<ActionKind> = if kind == ResourceKind::Container {
+            vec![
+                ActionKind::Start,
+                ActionKind::Stop,
+                ActionKind::Restart,
+                ActionKind::Remove,
+            ]
+        } else {
+            vec![ActionKind::Remove]
+        };
+
+        let mut cluster = div().flex().items_center().gap_1();
+        if kind == ResourceKind::Image {
+            let prefill = if title == "<none>" || title.ends_with('…') {
+                id.to_string()
+            } else {
+                title.to_string()
+            };
+            let mut run_button = div()
+                .id(SharedString::from(format!("run-image-{id}")))
+                .size(px(24.))
+                .occlude()
+                .rounded_md()
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(if emphasized { 1.0 } else { 0.25 })
+                .child(svg().path("icons/run.svg").size(px(14.)).text_color(theme.text));
+            if pending.is_none() {
+                run_button = run_button
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.hover))
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.open_run(Some(prefill.clone()), window, cx);
+                        cx.notify();
+                    }));
+            }
+            cluster = cluster.child(run_button);
+        }
+        for action in actions {
+            let enabled = action_enabled(state, kind, action) && pending.is_none();
+            let color = if enabled { theme.text } else { theme.text_dim };
+            let id_owned = id.to_string();
+            let title_owned = title.to_string();
+            let mut button = div()
+                .id(SharedString::from(format!(
+                    "act-{kind:?}-{id}-{}",
+                    action.verb()
+                )))
+                .size(px(24.))
+                .occlude()
+                .rounded_md()
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(if emphasized { 1.0 } else { 0.25 })
+                .child(svg().path(icon_for(action)).size(px(14.)).text_color(color));
+            if enabled {
+                button = button
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.hover))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.request_action(kind, &id_owned, &title_owned, action);
+                        cx.notify();
+                    }));
+            }
+            cluster = cluster.child(button);
+        }
+        cluster
+    }
+
+    fn render_row_menu(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
+        let menu = self.mutations.row_menu.clone()?;
+        let theme = self.theme.clone();
+        let page = match menu.kind {
+            ResourceKind::Container => Page::Containers,
+            ResourceKind::Image => Page::Images,
+            ResourceKind::Volume => Page::Volumes,
+        };
+        let title = self.tables[page.index()]
+            .rows
+            .iter()
+            .find(|row| row.id == menu.id)
+            .map(|row| row.cells[0].to_string())
+            .unwrap_or_else(|| menu.id.clone());
+        let state = if menu.kind == ResourceKind::Container {
+            self.snapshot
+                .containers
+                .iter()
+                .find(|container| container.id == menu.id)
+                .map(|container| container.state)
+        } else {
+            None
+        };
+
+        let viewport = window.viewport_size();
+        let (menu_x, menu_y) = crate::ui::mutations::clamp_menu_position(
+            f32::from(menu.at.x),
+            f32::from(menu.at.y),
+            200.0,
+            240.0,
+            f32::from(viewport.width),
+            f32::from(viewport.height),
+        );
+
+        let backdrop = div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.mutations.row_menu = None;
+                    cx.notify();
+                }),
+            );
+
+        let menu_kind = menu.kind;
+        let menu_id = menu.id.clone();
+
+        let mut panel = div()
+            .absolute()
+            .left(px(menu_x))
+            .top(px(menu_y))
+            .w(px(200.))
+            .p_1()
+            .occlude()
+            .flex()
+            .flex_col()
+            .rounded_md()
+            .bg(theme.panel)
+            .border_1()
+            .border_color(theme.border)
+            .shadow_lg();
+
+        panel = panel.child(row_menu_item(
+            "Open",
+            theme.text,
+            &theme,
+            cx,
+            move |this, _cx| {
+                this.open_detail_by_id(menu_kind, &menu_id);
+                this.mutations.row_menu = None;
+            },
+        ));
+
+        if menu.kind == ResourceKind::Container {
+            for action in [ActionKind::Start, ActionKind::Stop, ActionKind::Restart] {
+                if action_enabled(state, menu.kind, action) {
+                    let id = menu.id.clone();
+                    let title = title.clone();
+                    panel = panel.child(row_menu_item(
+                        action.verb(),
+                        theme.text,
+                        &theme,
+                        cx,
+                        move |this, _cx| {
+                            this.request_action(ResourceKind::Container, &id, &title, action);
+                            this.mutations.row_menu = None;
+                        },
+                    ));
+                }
+            }
+            panel = panel.child(crate::ui::dialog::menu_separator(&theme));
+        }
+
+        let remove_id = menu.id.clone();
+        let remove_title = title.clone();
+        let remove_kind = menu.kind;
+        let remove_pending = self
+            .mutations
+            .pending
+            .contains_key(&(menu.kind, menu.id.clone()));
+        if !remove_pending {
+            panel = panel.child(row_menu_item(
+                "Remove",
+                theme.error,
+                &theme,
+                cx,
+                move |this, _cx| {
+                    this.request_action(
+                        remove_kind,
+                        &remove_id,
+                        &remove_title,
+                        ActionKind::Remove,
+                    );
+                    this.mutations.row_menu = None;
+                },
+            ));
+        }
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .child(backdrop)
+                .child(panel),
+        )
+    }
+
+    fn render_toast(&mut self, cx: &mut Context<Self>) -> Option<Div> {
+        let toast = self.mutations.toast.clone()?;
+        let theme = self.theme.clone();
+        let border = if toast.error { theme.error } else { theme.border };
+        let text_color = if toast.error { theme.error } else { theme.text };
+        Some(
+            div()
+                .absolute()
+                .bottom(px(16.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(420.))
+                        .px_3()
+                        .py_2()
+                        .occlude()
+                        .rounded_md()
+                        .bg(theme.panel)
+                        .border_1()
+                        .border_color(border)
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .text_color(text_color)
+                                .child(toast.text),
+                        )
+                        .child(
+                            div()
+                                .id("toast-close")
+                                .cursor_pointer()
+                                .text_color(theme.text_dim)
+                                .hover(|style| style.text_color(theme.text))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.mutations.toast = None;
+                                    cx.notify();
+                                }))
+                                .child("×"),
+                        ),
+                ),
+        )
+    }
+
     fn retry_detail(&mut self) {
         if let Some(detail) = &mut self.detail {
             detail.error = None;
@@ -729,6 +1256,11 @@ impl RootView {
         } else {
             None
         };
+        let pending_label = self
+            .mutations
+            .pending
+            .get(&(detail.kind, detail.id.clone()))
+            .map(|action| action.action.pending_label());
 
         let body: gpui::AnyElement = if let Some(error) = detail.error.clone() {
             div()
@@ -828,6 +1360,30 @@ impl RootView {
                             .child(back_label),
                     )
                     .child(div().text_base().child(detail.title.clone()))
+                    .child({
+                        let state = if detail.kind == ResourceKind::Container {
+                            self.snapshot
+                                .containers
+                                .iter()
+                                .find(|container| container.id == detail.id)
+                                .map(|container| container.state)
+                        } else {
+                            None
+                        };
+                        div()
+                            .w(px(actions_width(detail.kind)))
+                            .child(self.render_action_buttons(
+                                detail.kind,
+                                &detail.id,
+                                detail.title.as_ref(),
+                                state,
+                                true,
+                                cx,
+                            ))
+                    })
+                    .when_some(pending_label, |this, label| {
+                        this.child(div().text_xs().text_color(theme.paused).child(label))
+                    })
                     .when(detail.tab == DetailTab::Logs, |this| {
                         this.child(
                             div()
@@ -857,6 +1413,382 @@ impl RootView {
             )
             .child(tab_strip)
             .child(body)
+    }
+
+    pub(crate) fn start_pull(&mut self, reference: &str, origin: PullOrigin) -> bool {
+        let reference = reference.trim();
+        if reference.is_empty() || self.mutations.pull.is_some() {
+            return false;
+        }
+        if self.service.is_none() {
+            self.mutations.toast = Some(Toast {
+                text: "No host connection".to_string(),
+                error: true,
+            });
+            return false;
+        }
+        let epoch = self.mutations.epoch;
+        self.mutations.pull = Some(PullState {
+            origin,
+            reference: reference.to_string(),
+            status: "Starting…".to_string(),
+            layers: BTreeMap::new(),
+            epoch,
+        });
+        self.mutations.pull_error = None;
+        self.mutations.pull_open = false;
+        if let Some(service) = &self.service {
+            service.request(Request::PullImage {
+                reference: reference.to_string(),
+                origin,
+                epoch,
+            });
+        }
+        true
+    }
+
+    fn retry_run_after_pull(&mut self) {
+        let epoch = self.mutations.epoch;
+        let Some(run) = &mut self.mutations.run else {
+            return;
+        };
+        if let Some(spec) = run.begin_retry(epoch) {
+            if let Some(service) = &self.service {
+                service.request(Request::RunContainer { spec, epoch });
+            }
+        }
+    }
+
+    fn render_pull_popover(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if self.page != Page::Images || !self.mutations.pull_open {
+            return None;
+        }
+        let theme = self.theme.clone();
+        let reference = self.mutations.pull_input.clone();
+        let error = self.mutations.pull_error.clone();
+        let pulling = self.mutations.pull.is_some();
+        let focused = self.pull_focus.is_focused(window);
+        Some(crate::ui::dialog::pull_popover(
+            &reference,
+            error.as_deref(),
+            pulling,
+            &self.pull_focus,
+            focused,
+            &theme,
+            cx,
+        ))
+    }
+
+    fn render_pull_strip(&mut self) -> Option<Div> {
+        let pull = self.mutations.pull.clone()?;
+        let theme = self.theme.clone();
+        let bytes = pull.bytes();
+        let fraction = pull.fraction();
+
+        let mut strip = div()
+            .h(px(32.))
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_3()
+            .bg(theme.panel)
+            .border_b_1()
+            .border_color(theme.border)
+            .text_xs()
+            .child(div().text_color(theme.text_dim).child("Pulling"))
+            .child(
+                div()
+                    .font_family("JetBrains Mono")
+                    .text_color(theme.text)
+                    .child(pull.reference.clone()),
+            );
+        if let Some((current, total)) = bytes {
+            strip = strip.child(
+                div()
+                    .text_color(theme.text_dim)
+                    .child(format!(
+                        "{} / {}",
+                        format_bytes(current as i64),
+                        format_bytes(total as i64)
+                    )),
+            );
+        }
+        strip = strip.child(
+            div()
+                .flex_1()
+                .truncate()
+                .text_color(theme.text_dim)
+                .child(pull.status.clone()),
+        );
+        if let Some(fraction) = fraction {
+            strip = strip.child(
+                div()
+                    .w(px(160.))
+                    .h(px(3.))
+                    .rounded_full()
+                    .bg(theme.border)
+                    .child(
+                        div()
+                            .h_full()
+                            .w(px(160. * fraction))
+                            .rounded_full()
+                            .bg(theme.accent),
+                    ),
+            );
+        }
+        Some(strip)
+    }
+
+    pub(crate) fn open_run(
+        &mut self,
+        prefill: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mutations.run.is_some() {
+            return;
+        }
+        self.mutations.pull_open = false;
+        self.host_menu_open = false;
+        self.mutations.run = Some(RunState {
+            form: RunForm {
+                image: prefill.unwrap_or_default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let focus = crate::ui::dialog::RunFocus::new(cx);
+        window.focus(&focus.image);
+        self.run_focus = Some(focus);
+    }
+
+    pub(crate) fn cancel_run(&mut self) {
+        let Some(run) = &self.mutations.run else {
+            return;
+        };
+        if run.submitting {
+            return;
+        }
+        self.mutations.run = None;
+        self.run_focus = None;
+    }
+
+    pub(crate) fn pull_run_image(&mut self) {
+        if self.mutations.pull.is_some() {
+            return;
+        }
+        let reference = match &self.mutations.run {
+            Some(run) => run
+                .submitted
+                .as_ref()
+                .map(|spec| spec.image.clone())
+                .unwrap_or_else(|| run.form.image.trim().to_string()),
+            None => return,
+        };
+        if reference.is_empty() {
+            return;
+        }
+        if self.start_pull(&reference, PullOrigin::RunRetry) {
+            if let Some(run) = &mut self.mutations.run {
+                run.pull_then_retry = true;
+            }
+        }
+    }
+
+    pub(crate) fn submit_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let epoch = self.mutations.epoch;
+        let Some(run) = self.mutations.run.as_mut() else {
+            return;
+        };
+        if run.submitting || run.pull_then_retry {
+            return;
+        }
+        match build_run_spec(&run.form) {
+            Err(errors) => {
+                let first_field = errors.first().map(|error| error.field);
+                run.field_errors = errors;
+                run.daemon_error = None;
+                if let (Some(field), Some(focus)) = (first_field, self.run_focus.as_ref()) {
+                    if let Some(handle) = focus.handle(field) {
+                        window.focus(&handle);
+                    }
+                }
+            }
+            Ok(spec) => {
+                run.field_errors.clear();
+                run.submitted = Some(spec.clone());
+                run.submitting = true;
+                run.pull_then_retry = false;
+                run.daemon_error = None;
+                run.epoch = epoch;
+                if let Some(service) = &self.service {
+                    service.request(Request::RunContainer { spec, epoch });
+                } else {
+                    run.submitting = false;
+                    run.daemon_error = Some("No host connection".to_string());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn run_field_text_mut(&mut self, field: RunField) -> Option<&mut String> {
+        let run = self.mutations.run.as_mut()?;
+        match field {
+            RunField::Image => Some(&mut run.form.image),
+            RunField::Name => Some(&mut run.form.name),
+            RunField::Command => Some(&mut run.form.command),
+            RunField::PortHost(index) => run.form.ports.get_mut(index).map(|port| &mut port.host),
+            RunField::PortContainer(index) => {
+                run.form.ports.get_mut(index).map(|port| &mut port.container)
+            }
+            RunField::EnvKey(index) => run.form.env.get_mut(index).map(|variable| &mut variable.key),
+            RunField::EnvValue(index) => {
+                run.form.env.get_mut(index).map(|variable| &mut variable.value)
+            }
+            RunField::MountSource(index) => {
+                run.form.mounts.get_mut(index).map(|mount| &mut mount.source)
+            }
+            RunField::MountTarget(index) => {
+                run.form.mounts.get_mut(index).map(|mount| &mut mount.target)
+            }
+        }
+    }
+
+    pub(crate) fn clear_run_field_error(&mut self, field: RunField) {
+        if let Some(run) = &mut self.mutations.run {
+            run.field_errors.retain(|error| error.field != field);
+            run.daemon_error = None;
+        }
+    }
+
+    pub(crate) fn add_run_port(&mut self, cx: &mut Context<Self>) {
+        if let Some(run) = &mut self.mutations.run {
+            if run.submitting {
+                return;
+            }
+            run.form.ports.push(crate::docker::actions::PortForm::default());
+        }
+        if let Some(focus) = &mut self.run_focus {
+            focus.add_port(cx);
+        }
+    }
+
+    pub(crate) fn remove_run_port(&mut self, index: usize) {
+        if let Some(run) = &mut self.mutations.run {
+            if run.submitting || index >= run.form.ports.len() {
+                return;
+            }
+            run.form.ports.remove(index);
+        }
+        if let Some(focus) = &mut self.run_focus {
+            focus.remove_port(index);
+        }
+    }
+
+    pub(crate) fn set_run_port_proto(&mut self, index: usize, proto: Proto) {
+        if let Some(port) = self
+            .mutations
+            .run
+            .as_mut()
+            .and_then(|run| run.form.ports.get_mut(index))
+        {
+            port.proto = proto;
+        }
+    }
+
+    pub(crate) fn add_run_env(&mut self, cx: &mut Context<Self>) {
+        if let Some(run) = &mut self.mutations.run {
+            if run.submitting {
+                return;
+            }
+            run.form.env.push(crate::docker::actions::EnvForm::default());
+        }
+        if let Some(focus) = &mut self.run_focus {
+            focus.add_env(cx);
+        }
+    }
+
+    pub(crate) fn remove_run_env(&mut self, index: usize) {
+        if let Some(run) = &mut self.mutations.run {
+            if run.submitting || index >= run.form.env.len() {
+                return;
+            }
+            run.form.env.remove(index);
+        }
+        if let Some(focus) = &mut self.run_focus {
+            focus.remove_env(index);
+        }
+    }
+
+    pub(crate) fn add_run_mount(&mut self, cx: &mut Context<Self>) {
+        if let Some(run) = &mut self.mutations.run {
+            if run.submitting {
+                return;
+            }
+            run.form.mounts.push(crate::docker::actions::MountForm::default());
+        }
+        if let Some(focus) = &mut self.run_focus {
+            focus.add_mount(cx);
+        }
+    }
+
+    pub(crate) fn remove_run_mount(&mut self, index: usize) {
+        if let Some(run) = &mut self.mutations.run {
+            if run.submitting || index >= run.form.mounts.len() {
+                return;
+            }
+            run.form.mounts.remove(index);
+        }
+        if let Some(focus) = &mut self.run_focus {
+            focus.remove_mount(index);
+        }
+    }
+
+    pub(crate) fn toggle_run_mount_read_only(&mut self, index: usize) {
+        if let Some(mount) = self
+            .mutations
+            .run
+            .as_mut()
+            .and_then(|run| run.form.mounts.get_mut(index))
+        {
+            mount.read_only = !mount.read_only;
+        }
+    }
+
+    fn apply_run_outcome(&mut self, outcome: RunOutcome) {
+        if outcome.close_dialog {
+            self.mutations.run = None;
+            self.run_focus = None;
+        }
+        if let Some(id) = outcome.select_container {
+            self.page = Page::Containers;
+            self.mutations.pending_select = Some(id);
+        }
+        if let Some(toast) = outcome.toast {
+            self.mutations.toast = Some(toast);
+        }
+        if outcome.refetch {
+            self.refresh();
+        }
+    }
+
+    fn render_run_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let run = self.mutations.run.clone()?;
+        let focus = self.run_focus.clone()?;
+        let theme = self.theme.clone();
+        let pulling = self.mutations.pull.is_some();
+        Some(crate::ui::dialog::run_dialog(
+            &run, &focus, pulling, &theme, window, cx,
+        ))
     }
 
     fn render_rail(&mut self, cx: &mut Context<Self>) -> Div {
@@ -937,6 +1869,58 @@ impl RootView {
                 div().text_color(theme.text).child(query).into_any_element()
             });
 
+        let pulling = self.mutations.pull.is_some();
+        let pull_color = if pulling { theme.text_dim } else { theme.text };
+        let mut pull_button = div()
+            .id("pull-button")
+            .h(px(28.))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .rounded_md()
+            .text_sm()
+            .text_color(pull_color)
+            .child(svg().path("icons/pull.svg").size(px(14.)).text_color(pull_color))
+            .child(if pulling { "Pulling…" } else { "Pull" });
+        if !pulling {
+            pull_button = pull_button
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.hover))
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.mutations.pull_open = !this.mutations.pull_open;
+                    this.host_menu_open = false;
+                    if this.mutations.pull_open {
+                        window.focus(&this.pull_focus);
+                    }
+                    cx.notify();
+                }));
+        }
+
+        let run_dialog_open = self.mutations.run.is_some();
+        let run_color = if run_dialog_open { theme.text_dim } else { theme.text };
+        let mut run_button = div()
+            .id("run-button")
+            .h(px(28.))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .rounded_md()
+            .text_sm()
+            .text_color(run_color)
+            .child(svg().path("icons/run.svg").size(px(14.)).text_color(run_color))
+            .child("Run");
+        if !run_dialog_open {
+            run_button = run_button
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.hover))
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.open_run(None, window, cx);
+                    cx.notify();
+                }));
+        }
+
         div()
             .h(px(56.))
             .px_4()
@@ -963,6 +1947,8 @@ impl RootView {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .when(self.page == Page::Containers, |this| this.child(run_button))
+                    .when(self.page == Page::Images, |this| this.child(pull_button))
                     .child(search)
                     .child(
                         div()
@@ -998,6 +1984,7 @@ impl RootView {
                             .hover(|s| s.bg(theme.hover))
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.host_menu_open = !this.host_menu_open;
+                                this.mutations.pull_open = false;
                                 if this.host_menu_open {
                                     if let Some(service) = &this.service {
                                         service.request(Request::ProbeHosts);
@@ -1112,6 +2099,7 @@ impl RootView {
         let active_sort = table.sort;
         let visible_count = table.visible().len();
         let selected = table.selected;
+        let actions = table.spec.actions;
 
         let mut header = div()
             .h(px(28.))
@@ -1148,6 +2136,10 @@ impl RootView {
             );
         }
 
+        if let Some(actions) = actions {
+            header = header.child(div().w(px(actions.width())).flex_shrink_0());
+        }
+
         let scroll_handle = self.tables[index].scroll.clone();
         let list = uniform_list(
             self.tables[index].spec.id,
@@ -1155,15 +2147,36 @@ impl RootView {
             cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
                 let mut rows = Vec::with_capacity(range.len());
                 let theme = this.theme.clone();
-                let table = &this.tables[index];
                 for position in range {
-                    let Some(&row_index) = table.visible().get(position) else {
+                    let Some(row_index) = this.tables[index]
+                        .visible()
+                        .get(position)
+                        .copied()
+                    else {
                         continue;
                     };
-                    let row = &table.rows[row_index];
+                    let Some((row_id, cells, accent)) = this.tables[index]
+                        .rows
+                        .get(row_index)
+                        .map(|row| (row.id.clone(), row.cells.clone(), row.accent))
+                    else {
+                        continue;
+                    };
                     let is_selected = selected == Some(row_index);
+                    let kind = actions.map(|actions| actions.kind());
+                    let pending = kind.and_then(|kind| {
+                        this.mutations
+                            .pending
+                            .get(&(kind, row_id.clone()))
+                            .copied()
+                    });
+                    let hovered_id = row_id.clone();
+                    let click_id = row_id.clone();
+                    let menu_kind = kind;
+                    let menu_id = row_id.clone();
+
                     let mut element = div()
-                        .id(SharedString::from(format!("row-{}", row.id)))
+                        .id(SharedString::from(format!("row-{row_id}")))
                         .h(px(ROW_HEIGHT))
                         .px_3()
                         .flex()
@@ -1171,28 +2184,115 @@ impl RootView {
                         .text_sm()
                         .cursor_pointer()
                         .bg(if is_selected { theme.selected } else { theme.bg })
-                        .hover(|s| s.bg(theme.hover))
+                        .hover(|style| style.bg(theme.hover))
+                        .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                            if *hovered {
+                                this.mutations.hovered_row = Some(hovered_id.clone());
+                            } else if this.mutations.hovered_row.as_deref()
+                                == Some(hovered_id.as_str())
+                            {
+                                this.mutations.hovered_row = None;
+                            }
+                            cx.notify();
+                        }))
                         .on_click(cx.listener(move |this, _event, _window, cx| {
                             this.current_table_mut().selected = Some(row_index);
                             this.open_detail(row_index);
                             cx.notify();
-                        }));
+                        }))
+                        .when_some(menu_kind, |this, kind| {
+                            this.on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, _window, cx| {
+                                    this.current_table_mut().selected = Some(row_index);
+                                    this.mutations.row_menu = Some(RowMenuState {
+                                        kind,
+                                        id: menu_id.clone(),
+                                        at: event.position,
+                                    });
+                                    cx.notify();
+                                }),
+                            )
+                        });
 
-                    for (column, cell) in row.cells.iter().enumerate() {
+                    for (column, cell) in cells.iter().enumerate() {
                         let width = widths[column];
-                        let color = if column == 1 {
-                            row.accent.unwrap_or(theme.text)
+                        let pending_container = kind == Some(ResourceKind::Container)
+                            && column == 1
+                            && pending.is_some();
+                        let color = if pending_container {
+                            theme.paused
+                        } else if column == 1 {
+                            accent.unwrap_or(theme.text)
                         } else {
                             theme.text
+                        };
+                        let text = if pending_container {
+                            pending
+                                .map(|action| action.action.pending_label())
+                                .unwrap_or_default()
+                        } else {
+                            cell.as_ref()
                         };
                         element = element.child(
                             div()
                                 .map_width(width)
                                 .truncate()
                                 .text_color(color)
-                                .child(cell.clone()),
+                                .child(SharedString::from(text.to_string())),
                         );
                     }
+
+                    if let (Some(actions), Some(kind)) = (actions, kind) {
+                        let state = if kind == ResourceKind::Container {
+                            this.snapshot
+                                .containers
+                                .iter()
+                                .find(|container| container.id == click_id)
+                                .map(|container| container.state)
+                        } else {
+                            None
+                        };
+                        let emphasized = is_selected
+                            || this.mutations.hovered_row.as_deref()
+                                == Some(click_id.as_str());
+                        let title = cells
+                            .first()
+                            .map(|cell| cell.to_string())
+                            .unwrap_or_default();
+                        let cluster = this.render_action_buttons(
+                            kind,
+                            &click_id,
+                            &title,
+                            state,
+                            emphasized,
+                            cx,
+                        );
+                        let cluster_hover_id = click_id.clone();
+                        element = element.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "row-actions-{click_id}"
+                                )))
+                                .w(px(actions.width()))
+                                .flex_shrink_0()
+                                .on_hover(cx.listener(
+                                    move |this, hovered: &bool, _window, cx| {
+                                        if *hovered {
+                                            this.mutations.hovered_row =
+                                                Some(cluster_hover_id.clone());
+                                        } else if this.mutations.hovered_row.as_deref()
+                                            == Some(cluster_hover_id.as_str())
+                                        {
+                                            this.mutations.hovered_row = None;
+                                        }
+                                        cx.notify();
+                                    },
+                                ))
+                                .child(cluster),
+                        );
+                    }
+
                     rows.push(element);
                 }
                 rows
@@ -1245,6 +2345,65 @@ trait MapWidth: Styled + Sized {
 }
 
 impl<E: Styled + Sized> MapWidth for E {}
+
+fn icon_for(action: ActionKind) -> &'static str {
+    match action {
+        ActionKind::Start => "icons/play.svg",
+        ActionKind::Stop => "icons/stop.svg",
+        ActionKind::Restart => "icons/restart.svg",
+        ActionKind::Remove => "icons/trash.svg",
+    }
+}
+
+fn action_enabled(state: Option<ContainerState>, kind: ResourceKind, action: ActionKind) -> bool {
+    if action == ActionKind::Remove {
+        return true;
+    }
+    if kind != ResourceKind::Container {
+        return false;
+    }
+    let Some(state) = state else {
+        return false;
+    };
+    let available = container_actions(state);
+    match action {
+        ActionKind::Start => available.start,
+        ActionKind::Stop => available.stop,
+        ActionKind::Restart => available.restart,
+        ActionKind::Remove => available.remove,
+    }
+}
+
+fn actions_width(kind: ResourceKind) -> f32 {
+    match kind {
+        ResourceKind::Container => ActionsColumn::Container.width(),
+        ResourceKind::Image => ActionsColumn::Image.width(),
+        ResourceKind::Volume => ActionsColumn::Volume.width(),
+    }
+}
+
+fn row_menu_item(
+    label: &'static str,
+    color: gpui::Rgba,
+    theme: &Theme,
+    cx: &mut Context<RootView>,
+    on_click: impl Fn(&mut RootView, &mut Context<RootView>) + 'static,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(SharedString::from(format!("row-menu-{label}")))
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .text_sm()
+        .text_color(color)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.hover))
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            on_click(this, cx);
+            cx.notify();
+        }))
+        .child(label)
+}
 
 fn render_inspect_tree(nodes: &[InspectNode], theme: &Theme) -> impl IntoElement {
     let mut container = div()
@@ -1359,6 +2518,10 @@ impl Render for RootView {
                 .flex_col()
                 .child(header);
 
+            if let Some(strip) = self.render_pull_strip() {
+                column = column.child(strip);
+            }
+
             if let Some(error) = self.last_error.clone() {
                 column = column.child(
                     div()
@@ -1428,14 +2591,47 @@ impl Render for RootView {
                 this.go_back();
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &crate::actions::RunContainer, window, cx| {
+                if this.mutations.confirm.is_some() || this.mutations.run.is_some() {
+                    return;
+                }
+                this.open_run(None, window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::PullImage, window, cx| {
+                if this.mutations.confirm.is_some() || this.mutations.run.is_some() {
+                    return;
+                }
+                this.close_detail();
+                this.switch_page(Page::Images);
+                this.mutations.pull_open = true;
+                this.host_menu_open = false;
+                window.focus(&this.pull_focus);
+                cx.notify();
+            }))
             .on_action(cx.listener(|_, _: &crate::actions::Quit, _window, cx| {
                 cx.quit();
             }));
 
         root = root.child(rail).child(content);
 
+        if let Some(popover) = self.render_pull_popover(window, cx) {
+            root = root.child(popover);
+        }
         if let Some(menu) = menu {
             root = root.child(menu);
+        }
+        if let Some(row_menu) = self.render_row_menu(window, cx) {
+            root = root.child(row_menu);
+        }
+        if let Some(confirm) = self.mutations.confirm.clone() {
+            root = root.child(crate::ui::dialog::confirm(&confirm, &theme, cx));
+        }
+        if let Some(dialog) = self.render_run_dialog(window, cx) {
+            root = root.child(dialog);
+        }
+        if let Some(toast) = self.render_toast(cx) {
+            root = root.child(toast);
         }
 
         root
@@ -1477,6 +2673,7 @@ mod tests {
             created: now(),
             created_label: SharedString::from("2m ago"),
             in_use,
+            tag_count: 1,
         }
     }
 
@@ -1487,6 +2684,26 @@ mod tests {
             mountpoint: SharedString::from("/var/lib/docker/volumes/x/_data"),
             created_label: SharedString::from("2m ago"),
         }
+    }
+
+    #[test]
+    fn each_table_declares_its_action_column() {
+        let snapshot = Snapshot::empty();
+        assert_eq!(
+            RootView::containers_table(&snapshot).spec.actions,
+            Some(ActionsColumn::Container)
+        );
+        assert_eq!(
+            RootView::images_table(&snapshot).spec.actions,
+            Some(ActionsColumn::Image)
+        );
+        assert_eq!(
+            RootView::volumes_table(&snapshot).spec.actions,
+            Some(ActionsColumn::Volume)
+        );
+        assert_eq!(ActionsColumn::Container.width(), 124.0);
+        assert_eq!(ActionsColumn::Image.width(), 84.0);
+        assert_eq!(ActionsColumn::Volume.width(), 44.0);
     }
 
     #[test]
