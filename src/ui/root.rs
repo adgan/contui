@@ -2,6 +2,9 @@ use crate::docker::endpoint::{discover, HostInfo, HostStatus};
 use crate::docker::model::{ContainerState, Snapshot};
 use crate::docker::service::{DockerService, Request, Response};
 use crate::theme::Theme;
+use crate::docker::model::ResourceKind;
+use crate::ui::detail::{render_logs, DetailState, DetailTab};
+use crate::ui::inspect::{build_tree, InspectNode};
 use crate::ui::table::{ColumnWidth, SortValue, TableRow, TableSpec, TableState};
 use chrono::Utc;
 use gpui::prelude::*;
@@ -67,6 +70,7 @@ pub struct RootView {
     pub tables: [TableState; 3],
     pub last_error: Option<String>,
     pub host_menu_open: bool,
+    pub detail: Option<DetailState>,
     search_focus: FocusHandle,
     root_focus: FocusHandle,
     focus_initialized: bool,
@@ -95,6 +99,7 @@ impl RootView {
             ],
             last_error: None,
             host_menu_open: false,
+            detail: None,
             search_focus: cx.focus_handle(),
             root_focus: cx.focus_handle(),
             focus_initialized: false,
@@ -284,6 +289,24 @@ impl RootView {
                 self.snapshot = snapshot;
                 self.rebuild_tables();
                 self.last_error = None;
+                if let Some(detail) = &mut self.detail {
+                    let present = match detail.kind {
+                        ResourceKind::Container => {
+                            self.snapshot.containers.iter().any(|c| c.id == detail.id)
+                        }
+                        ResourceKind::Image => {
+                            self.snapshot.images.iter().any(|i| i.id == detail.id)
+                        }
+                        ResourceKind::Volume => self
+                            .snapshot
+                            .volumes
+                            .iter()
+                            .any(|v| v.name.as_ref() == detail.id),
+                    };
+                    if !present {
+                        detail.missing = true;
+                    }
+                }
             }
             Response::Status(status) => self.status = status,
             Response::HostStatuses(statuses) => {
@@ -294,15 +317,47 @@ impl RootView {
                 }
             }
             Response::Dirty { kinds, ids } => {
-                let _ = (kinds, ids);
+                let _ = kinds;
+                if let Some(detail) = &mut self.detail {
+                    let touched = ids
+                        .iter()
+                        .any(|(kind, id)| *kind == detail.kind && *id == detail.id);
+                    if touched && !detail.missing {
+                        detail.inspect = None;
+                    }
+                }
                 if let Some(service) = &self.service {
                     service.request(Request::FetchAll);
+                }
+                if let Some(detail) = self.detail.clone() {
+                    if !detail.missing {
+                        if let Some(service) = &self.service {
+                            service.request(Request::Inspect {
+                                kind: detail.kind,
+                                id: detail.id.clone(),
+                            });
+                        }
+                    }
                 }
             }
             Response::Failed { what, message } => {
                 self.last_error = Some(format!("{what}: {message}"));
             }
-            Response::Inspect { .. } | Response::Logs { .. } => {}
+            Response::Inspect { kind, id, json } => {
+                if let Some(detail) = &mut self.detail {
+                    if detail.kind == kind && detail.id == id {
+                        detail.inspect = Some(build_tree(&json, 2));
+                        detail.missing = false;
+                    }
+                }
+            }
+            Response::Logs { id, lines } => {
+                if let Some(detail) = &mut self.detail {
+                    if detail.id == id {
+                        detail.logs = Some(lines);
+                    }
+                }
+            }
         }
     }
 
@@ -431,6 +486,9 @@ impl RootView {
                 cx.notify();
             }
             "escape" => {
+                if self.detail.is_some() {
+                    self.close_detail();
+                }
                 self.host_menu_open = false;
                 cx.notify();
             }
@@ -470,6 +528,175 @@ impl RootView {
             .map(|h| h.name.clone())
             .unwrap_or_else(|| "no host".to_string())
             .into()
+    }
+
+    fn open_detail(&mut self, row_index: usize) {
+        let page = self.page;
+        let Some(row) = self.tables[page.index()].rows.get(row_index) else {
+            return;
+        };
+        let kind = match page {
+            Page::Containers => ResourceKind::Container,
+            Page::Images => ResourceKind::Image,
+            Page::Volumes => ResourceKind::Volume,
+        };
+        let detail = DetailState::new(kind, row.id.clone(), row.cells[0].clone());
+        let id = detail.id.clone();
+        self.detail = Some(detail);
+        if let Some(service) = &self.service {
+            service.request(Request::Inspect { kind, id });
+        }
+    }
+
+    fn close_detail(&mut self) {
+        self.detail = None;
+    }
+
+    fn select_tab(&mut self, tab: DetailTab) {
+        let Some(detail) = &mut self.detail else {
+            return;
+        };
+        if detail.kind != ResourceKind::Container && tab == DetailTab::Logs {
+            return;
+        }
+        detail.tab = tab;
+        let needs_logs =
+            tab == DetailTab::Logs && !detail.logs_requested && detail.kind == ResourceKind::Container;
+        if needs_logs {
+            detail.logs_requested = true;
+            let id = detail.id.clone();
+            if let Some(service) = &self.service {
+                service.request(Request::Logs { id });
+            }
+        }
+    }
+
+    fn render_detail(&mut self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme.clone();
+        let Some(detail) = self.detail.clone() else {
+            return div();
+        };
+
+        let tabs: Vec<DetailTab> = if detail.kind == ResourceKind::Container {
+            vec![DetailTab::Inspect, DetailTab::Logs]
+        } else {
+            vec![DetailTab::Inspect]
+        };
+
+        let mut tab_strip = div().flex().items_center().gap_1().px_3().h(px(36.)).border_b_1().border_color(theme.border);
+        for tab in tabs {
+            let selected = detail.tab == tab;
+            let label = match tab {
+                DetailTab::Inspect => "Inspect",
+                DetailTab::Logs => "Logs",
+            };
+            let color = if selected { theme.text } else { theme.text_dim };
+            tab_strip = tab_strip.child(
+                div()
+                    .id(SharedString::from(format!("tab-{label}")))
+                    .px_3()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .text_sm()
+                    .text_color(color)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.text))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.select_tab(tab);
+                        cx.notify();
+                    }))
+                    .child(label),
+            );
+        }
+
+        let status = if detail.missing {
+            Some("no longer exists".to_string())
+        } else {
+            None
+        };
+
+        let body: gpui::AnyElement = if detail.missing {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(theme.text_dim)
+                .child(format!("{} no longer exists", detail.title))
+                .into_any_element()
+        } else {
+            match detail.tab {
+                DetailTab::Inspect => match &detail.inspect {
+                    Some(nodes) => render_inspect_tree(nodes, &theme).into_any_element(),
+                    None => div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(theme.text_dim)
+                        .child("Loading inspect…")
+                        .into_any_element(),
+                },
+                DetailTab::Logs => match &detail.logs {
+                    Some(lines) => render_logs(lines, &theme).into_any_element(),
+                    None => div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(theme.text_dim)
+                        .child("Loading logs…")
+                        .into_any_element(),
+                },
+            }
+        };
+
+        let back_label = format!("‹ {}", self.page.title());
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(56.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .id("back")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_sm()
+                            .text_color(theme.text_dim)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.hover))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.close_detail();
+                                cx.notify();
+                            }))
+                            .child(back_label),
+                    )
+                    .child(div().text_base().child(detail.title.clone()))
+                    .when_some(status, |this, status| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.paused)
+                                .child(status),
+                        )
+                    }),
+            )
+            .child(tab_strip)
+            .child(body)
     }
 
     fn render_rail(&mut self, cx: &mut Context<Self>) -> Div {
@@ -793,6 +1020,7 @@ impl RootView {
                         .hover(|s| s.bg(theme.hover))
                         .on_click(cx.listener(move |this, _event, _window, cx| {
                             this.current_table_mut().selected = Some(row_index);
+                            this.open_detail(row_index);
                             cx.notify();
                         }));
 
@@ -857,6 +1085,65 @@ trait MapWidth: Styled + Sized {
 
 impl<E: Styled + Sized> MapWidth for E {}
 
+fn render_inspect_tree(nodes: &[InspectNode], theme: &Theme) -> impl IntoElement {
+    let mut container = div()
+        .id("inspect-tree")
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .p_3()
+        .flex()
+        .flex_col()
+        .gap_2();
+
+    for node in nodes {
+        let mut group = div().flex().flex_col().gap_1().child(
+            div()
+                .text_xs()
+                .text_color(theme.text_dim)
+                .child(node.key.clone()),
+        );
+
+        if let Some(value) = node.value.clone() {
+            group = group.child(
+                div()
+                    .text_xs()
+                    .font_family("Menlo")
+                    .text_color(theme.text)
+                    .child(value),
+            );
+        }
+
+        for child in node.children.iter() {
+            let mut row = div().pl_3().flex().gap_3();
+            row = row.child(
+                div()
+                    .w(px(180.))
+                    .flex_shrink_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme.text_dim)
+                    .child(child.key.clone()),
+            );
+            row = row.child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_xs()
+                    .font_family("Menlo")
+                    .text_color(theme.text)
+                    .child(child.value.clone().unwrap_or_default()),
+            );
+            group = group.child(row);
+        }
+
+        container = container.child(group);
+    }
+
+    container
+}
+
 fn state_label(state: ContainerState) -> &'static str {
     match state {
         ContainerState::Running => "running",
@@ -896,10 +1183,23 @@ impl Render for RootView {
         }
 
         let theme = self.theme.clone();
-        let header = self.render_header(cx);
         let rail = self.render_rail(cx);
-        let table = self.render_table(cx);
         let menu = self.render_host_menu(cx);
+        let content: gpui::AnyElement = if self.detail.is_some() {
+            self.render_detail(cx).into_any_element()
+        } else {
+            let header = self.render_header(cx);
+            let table = self.render_table(cx);
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .h_full()
+                .flex()
+                .flex_col()
+                .child(header)
+                .child(table)
+                .into_any_element()
+        };
 
         let mut root = div()
             .size_full()
@@ -910,9 +1210,7 @@ impl Render for RootView {
             .track_focus(&self.root_focus)
             .on_key_down(cx.listener(|this, event, window, cx| this.on_root_key(event, window, cx)));
 
-        root = root
-            .child(rail)
-            .child(div().flex_1().min_w(px(0.)).h_full().flex().flex_col().child(header).child(table));
+        root = root.child(rail).child(content);
 
         if let Some(menu) = menu {
             root = root.child(menu);
