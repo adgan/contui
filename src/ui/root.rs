@@ -321,6 +321,8 @@ impl RootView {
         self._pump = None;
         self.host_menu_open = false;
         reset_host_data(&mut self.snapshot, &mut self.tables, &mut self.detail);
+        self.mutations = Mutations::new();
+        self.run_focus = None;
         self.last_error = None;
         self.status = HostStatus::Unknown;
         match DockerService::connect(host) {
@@ -394,12 +396,24 @@ impl RootView {
                 }
             }
             Response::Status(status) => {
+                let had_work = self.mutations.has_in_flight();
                 if should_refetch_on_status(&self.status, &status) {
                     self.status = status;
                     self.last_error = None;
                     self.refresh();
                 } else {
                     self.status = status;
+                }
+                if !matches!(self.status, HostStatus::Connected) && had_work {
+                    self.mutations.clear_in_flight();
+                    self.mutations.confirm = None;
+                    self.mutations.run = None;
+                    self.run_focus = None;
+                    self.mutations.row_menu = None;
+                    self.mutations.toast = Some(Toast {
+                        text: "Host disconnected — action interrupted".to_string(),
+                        error: true,
+                    });
                 }
             }
             Response::HostStatuses(statuses) => {
@@ -588,6 +602,29 @@ impl RootView {
     /// Esc is bound to the `Back` action, which gpui dispatches before element
     /// key handlers, so the query-clearing behaviour lives here.
     fn go_back(&mut self) {
+        if let Some(confirm) = &self.mutations.confirm {
+            if !confirm.submitting {
+                self.cancel_confirm();
+            }
+            return;
+        }
+        if let Some(run) = &self.mutations.run {
+            if !run.submitting {
+                self.cancel_run();
+            }
+            return;
+        }
+        if self.mutations.row_menu.take().is_some() {
+            return;
+        }
+        if self.mutations.pull_open {
+            self.mutations.pull_open = false;
+            return;
+        }
+        if self.host_menu_open {
+            self.host_menu_open = false;
+            return;
+        }
         let query = self.current_table().query.clone();
         match escape_action(&query) {
             EscapeAction::ClearQuery => {
@@ -2481,6 +2518,24 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &crate::actions::Back, _window, cx| {
                 this.go_back();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::RunContainer, window, cx| {
+                if this.mutations.confirm.is_some() || this.mutations.run.is_some() {
+                    return;
+                }
+                this.open_run(None, window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::PullImage, window, cx| {
+                if this.mutations.confirm.is_some() || this.mutations.run.is_some() {
+                    return;
+                }
+                this.close_detail();
+                this.switch_page(Page::Images);
+                this.mutations.pull_open = true;
+                this.host_menu_open = false;
+                window.focus(&this.pull_focus);
                 cx.notify();
             }))
             .on_action(cx.listener(|_, _: &crate::actions::Quit, _window, cx| {

@@ -12,9 +12,19 @@ First version scope: **containers, images and volumes**, read-only.
 - Finds any local Docker host: `DOCKER_HOST`, `DOCKER_CONTEXT`, every context in `~/.docker/contexts` (Rancher Desktop, Docker Desktop, Colima, OrbStack all register one), and the common socket paths. A host switcher in the header probes each one on open.
 - Tells you the truth when the engine is down: the header chip turns red, a banner or the empty area names the problem (an unreachable socket and a permission error read differently), Retry and ⌘R both re-ask, and the last known rows stay on screen instead of vanishing. When the engine comes back the list refetches itself — events that happened while it was down are never replayed.
 
+## Doing things
+
+Containers, images and volumes are no longer read-only:
+
+- **Containers** — start, stop, restart, remove. Hover a row for the icons, right-click for the same menu, or use the detail page. Remove always asks first; **Force** is an explicit choice when the container is running.
+- **Images** — remove (Force when a container uses it), Run (opens the form pre-filled), and Pull from the header. Pull shows layer progress and leaves the tables live.
+- **Volumes** — remove. The daemon's "in use" error stays in the confirm dialog.
+- **Run** builds a container from image, name, command, ports, environment and volumes, starts it, and opens its detail page. If the image is not local, the dialog offers **Pull it** and retries the submitted form.
+- Nothing is optimistic: a pending row reads `Starting…` / `Removing…`, the event stream confirms, and the list refetches. A failure keeps the last rows on screen and names the daemon's error.
+
 ## Not in this version
 
-- **Read-only.** No start / stop / restart / remove / pull / run. Those change the architecture (confirmations, optimistic updates) and get designed on their own.
+- **No prune, bulk actions, exec, builds or Compose.** No registry login: private images fail with the daemon's auth error. A pull cannot be cancelled. Stop uses Docker's 10-second grace; there is no separate kill.
 - No live CPU/memory columns (that needs one `/stats` stream per running container).
 - No log following — the Logs tab is a 500-line tail with timestamps and a Reload button.
 - `ssh://` hosts are listed but not connected; no passphrase prompt yet.
@@ -43,6 +53,8 @@ open target/Dockyard.app
 | --- | --- |
 | ⌘1 / ⌘2 / ⌘3 | Containers / Images / Volumes |
 | ⌘F | Focus search |
+| ⌘N | Run a container |
+| ⌘⇧P | Pull an image |
 | ⌘R | Refresh |
 | ⌘Q | Quit |
 | ↑ / ↓ | Move selection |

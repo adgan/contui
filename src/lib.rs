@@ -4,7 +4,8 @@ use gpui::{
 };
 
 use crate::actions::{
-    Back, FocusSearch, Quit, Refresh, ShowContainers, ShowImages, ShowVolumes,
+    Back, FocusSearch, PullImage, Quit, Refresh, RunContainer, ShowContainers, ShowImages,
+    ShowVolumes,
 };
 
 pub mod actions;
@@ -38,6 +39,8 @@ pub fn run() {
             KeyBinding::new("cmd-3", ShowVolumes, None),
             KeyBinding::new("cmd-r", Refresh, None),
             KeyBinding::new("cmd-f", FocusSearch, None),
+            KeyBinding::new("cmd-n", RunContainer, None),
+            KeyBinding::new("cmd-shift-p", PullImage, None),
             KeyBinding::new("escape", Back, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
@@ -46,6 +49,13 @@ pub fn run() {
                 name: "Dockyard".into(),
                 items: vec![
                     MenuItem::action("Quit Dockyard", Quit),
+                ],
+            },
+            Menu {
+                name: "Docker".into(),
+                items: vec![
+                    MenuItem::action("Run Container…", RunContainer),
+                    MenuItem::action("Pull Image…", PullImage),
                 ],
             },
             Menu {
