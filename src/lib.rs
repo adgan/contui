@@ -46,9 +46,9 @@ pub fn run() {
         ]);
         cx.set_menus(vec![
             Menu {
-                name: "Dockyard".into(),
+                name: "contUI".into(),
                 items: vec![
-                    MenuItem::action("Quit Dockyard", Quit),
+                    MenuItem::action("Quit contUI", Quit),
                 ],
             },
             Menu {
@@ -77,7 +77,7 @@ pub fn run() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(960.), px(600.))),
                 titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Dockyard".into()),
+                    title: Some("contUI".into()),
                     appears_transparent: false,
                     traffic_light_position: None,
                 }),

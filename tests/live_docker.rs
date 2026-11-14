@@ -1,6 +1,6 @@
-use dockyard::docker::actions::{ContainerAction, PortSpec, RunSpec};
-use dockyard::docker::endpoint::discover;
-use dockyard::docker::service::{DockerService, PullOrigin, Request, Response};
+use contui::docker::actions::{ContainerAction, PortSpec, RunSpec};
+use contui::docker::endpoint::discover;
+use contui::docker::service::{DockerService, PullOrigin, Request, Response};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

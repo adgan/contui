@@ -1,4 +1,4 @@
-# Dockyard — a fast Docker client in GPUI — design
+# contUI — a fast Docker client in GPUI — design
 
 Date: 2026-11-14
 Status: approved 2026-11-14
@@ -13,7 +13,8 @@ below is judged against them.
 The app navigates the way Docker Desktop does: an icon rail on the left, a table per
 resource, clicking a row drills into a detail page with tabs, and a back arrow returns.
 
-The working name is **Dockyard** (binary `dockyard`); it is a label, not a decision.
+The product name is **contUI** (binary `contui`), settled 2026-11-14; it began as the
+working name Dockyard and was renamed to contUI once the first implementation existed.
 
 ## Why now
 
@@ -202,7 +203,7 @@ handling misbehaves, fall back to a standard titlebar — builder's call, not a 
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  ⌘ dockyard · Containers          ⌕ search…      ⟳   runner ▾ │
+│  ⌘ contUI · Containers          ⌕ search…      ⟳   runner ▾ │
 ├────┬─────────────────────────────────────────────────────────┤
 │ ▣  │ Containers  16     3 running · 13 stopped                │
 │ ▤  │                                                          │
@@ -283,14 +284,21 @@ Bundled fonts: Inter (UI) and JetBrains Mono (IDs, logs, inspect values) as GPUI
 
 v1 is defined by `cargo run` working from the repo — that is how it is developed and how
 it is accepted. On top of that, the last task adds `just bundle` (a short shell script,
-no extra tooling): builds release, assembles `Dockyard.app` with an `Info.plist`
-(`CFBundleIdentifier: dev.local.dockyard`, name, version, icon), ad-hoc codesigns it,
+no extra tooling): builds release, assembles `contUI.app` with an `Info.plist`
+(`CFBundleIdentifier: dev.local.contui`, name, version, icon), ad-hoc codesigns it,
 and drops it in `target/`. No notarization, no App Store.
 
 Consequence for the menu bar: menus are registered through GPUI (`cx.set_menus`) and
 must work in **both** an unbundled binary and a bundle. If the transparent titlebar or
 menu behaves differently unbundled, the unbundled path gets a plain titlebar and we do
 not spend time on parity; the bundle is the real artifact.
+
+**Distribution, added 2026-11-14.** v1 still ships via `just bundle`, and distribution is
+a public Homebrew tap at `github.com/adgan/homebrew-tap` (installed as `adgan/tap`). The
+formula is HEAD-only and builds from source until `v0.1.0` is tagged; bottles and a cask
+for `/Applications` follow in plan Task 10. See
+`2026-11-14-homebrew-tap-design.md` for the tap's own design, including why there is no
+cask yet and why `brew trust` is part of the install steps.
 
 ## Testing
 
@@ -308,14 +316,14 @@ not spend time on parity; the bundle is the real artifact.
 
 1. `cargo run` opens on Rancher Desktop and lists all 16 containers with correct states.
 2. Images (45) and volumes (1) tabs list without a visible pause.
-3. `docker run -d --name dockyard-test alpine sleep 300` → row appears within ~1s with
-   no manual refresh; `docker stop dockyard-test` → state flips in place.
+3. `docker run -d --name contui-test alpine sleep 300` → row appears within ~1s with
+   no manual refresh; `docker stop contui-test` → state flips in place.
 4. Search "postgres" narrows to the one container; Esc restores; sort by Name reverses.
 5. Opening sploney-db-1 shows Inspect (ports, mounts, env) and Logs with real output.
 6. Killing Rancher Desktop shows the disconnected state instead of a frozen or empty
    list; restarting it recovers without an app restart.
 7. Switching to `DOCKER_HOST`/another context reloads all three lists.
-8. `just bundle` produces a `Dockyard.app` that launches from Finder with a menu bar and
+8. `just bundle` produces a `contUI.app` that launches from Finder with a menu bar and
    the packaged fonts.
 
 ## Risks

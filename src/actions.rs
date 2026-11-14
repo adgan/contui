@@ -1,7 +1,7 @@
 use gpui::actions;
 
 actions!(
-    dockyard,
+    contui,
     [
         ShowContainers,
         ShowImages,

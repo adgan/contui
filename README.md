@@ -1,4 +1,4 @@
-# Dockyard
+# contUI
 
 A native macOS Docker client, written in Rust on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) — the UI framework behind Zed. It exists because the Rancher Desktop dashboard is slow and ugly: this one renders on the GPU, has no webview, and updates from the Docker daemon's event stream instead of polling.
 
@@ -30,6 +30,13 @@ Containers, images and volumes are no longer read-only:
 - `ssh://` hosts are listed but not connected; no passphrase prompt yet.
 - No Compose grouping, no exec shell, no builds, no Kubernetes view.
 
+## Install with Homebrew
+
+A public tap carries the app: `brew install --HEAD adgan/tap/contui`. The
+[tap README](https://github.com/adgan/homebrew-tap) covers trust, launch, upgrade and
+uninstall. It is a source build until the first tagged release, so it needs Rust and the
+Xcode Command Line Tools.
+
 ## Build and run
 
 Requirements: Rust stable (1.99+), Xcode Command Line Tools, and a running Docker engine (tested against Rancher Desktop).
@@ -42,10 +49,10 @@ For a Finder-launchable app:
 
 ```sh
 ./bundle.sh        # or: just bundle, if you have just
-open target/Dockyard.app
+open target/contUI.app
 ```
 
-`bundle.sh` builds release, assembles `Dockyard.app` with `assets/Info.plist`, ad-hoc signs it, and drops it in `target/`. It is not notarized: Gatekeeper will only accept it locally.
+`bundle.sh` builds release, assembles `contUI.app` with `assets/Info.plist`, ad-hoc signs it, and drops it in `target/`. It is not notarized: Gatekeeper will only accept it locally.
 
 ## Keyboard
 
