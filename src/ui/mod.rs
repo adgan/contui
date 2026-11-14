@@ -1,4 +1,5 @@
 pub mod detail;
+pub mod dialog;
 pub mod empty;
 pub mod inspect;
 pub mod mutations;

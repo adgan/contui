@@ -12,12 +12,23 @@ impl AssetSource for Assets {
             "fonts/JetBrainsMono.ttf" => {
                 Some(include_bytes!("../assets/fonts/JetBrainsMono.ttf"))
             }
+            "icons/play.svg" => Some(include_bytes!("../assets/icons/play.svg")),
+            "icons/stop.svg" => Some(include_bytes!("../assets/icons/stop.svg")),
+            "icons/restart.svg" => Some(include_bytes!("../assets/icons/restart.svg")),
+            "icons/trash.svg" => Some(include_bytes!("../assets/icons/trash.svg")),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))
     }
 
     fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
-        Ok(vec!["fonts/Inter.ttf".into(), "fonts/JetBrainsMono.ttf".into()])
+        Ok(vec![
+            "fonts/Inter.ttf".into(),
+            "fonts/JetBrainsMono.ttf".into(),
+            "icons/play.svg".into(),
+            "icons/stop.svg".into(),
+            "icons/restart.svg".into(),
+            "icons/trash.svg".into(),
+        ])
     }
 }
