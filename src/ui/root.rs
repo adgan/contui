@@ -1,4 +1,6 @@
-use crate::docker::actions::{container_actions, ActionKind, ContainerAction, Target};
+use crate::docker::actions::{
+    build_run_spec, container_actions, ActionKind, ContainerAction, Proto, RunField, RunForm, Target,
+};
 use crate::docker::endpoint::{discover, HostInfo, HostStatus};
 use crate::docker::model::{format_bytes, ContainerState, Snapshot};
 use crate::docker::service::{DockerService, PullOrigin, Request, Response};
@@ -6,12 +8,12 @@ use crate::theme::Theme;
 use crate::docker::model::ResourceKind;
 use crate::ui::detail::{render_logs, DetailState, DetailTab};
 use crate::ui::inspect::{build_tree, InspectNode};
-use crate::ui::mutations::{Mutations, PullState, RowMenuState, Toast};
+use crate::ui::mutations::{Mutations, PullState, RowMenuState, RunOutcome, RunState, Toast};
 use crate::ui::table::{ActionsColumn, ColumnWidth, SortValue, TableRow, TableSpec, TableState};
 use chrono::Utc;
 use gpui::prelude::*;use gpui::{
     Context, Div, FocusHandle, KeyDownEvent, MouseButton, Render, SharedString, Subscription, Task,
-    Window, div, px, svg, uniform_list,
+    Window, AnyElement, div, px, svg, uniform_list,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -130,6 +132,7 @@ pub struct RootView {
     search_focus: FocusHandle,
     root_focus: FocusHandle,
     pull_focus: FocusHandle,
+    run_focus: Option<crate::ui::dialog::RunFocus>,
     focus_initialized: bool,
     activation: Option<Subscription>,
     _pump: Option<Task<()>>,
@@ -161,6 +164,7 @@ impl RootView {
             search_focus: cx.focus_handle(),
             root_focus: cx.focus_handle(),
             pull_focus: cx.focus_handle(),
+            run_focus: None,
             focus_initialized: false,
             activation: None,
             _pump: None,
@@ -358,6 +362,18 @@ impl RootView {
                 self.snapshot = snapshot;
                 self.rebuild_tables();
                 self.last_error = None;
+                if let Some(id) = self.mutations.pending_select.take() {
+                    let page_index = Page::Containers.index();
+                    if let Some(row_index) = self.tables[page_index]
+                        .rows
+                        .iter()
+                        .position(|row| row.id == id)
+                    {
+                        self.page = Page::Containers;
+                        self.tables[page_index].selected = Some(row_index);
+                        self.open_detail(row_index);
+                    }
+                }
                 if let Some(detail) = &mut self.detail {
                     let present = match detail.kind {
                         ResourceKind::Container => {
@@ -490,7 +506,20 @@ impl RootView {
                     self.refresh();
                 }
             }
-            Response::ContainerCreated { .. } | Response::RunFailed { .. } => {}
+            Response::ContainerCreated { id, warnings } => {
+                let outcome = self.mutations.apply_run_created(id, warnings);
+                self.apply_run_outcome(outcome);
+            }
+            Response::RunFailed {
+                message,
+                missing_image,
+                created,
+            } => {
+                let outcome = self
+                    .mutations
+                    .apply_run_failed(message, missing_image, created);
+                self.apply_run_outcome(outcome);
+            }
         }
     }
 
@@ -858,6 +887,33 @@ impl RootView {
         };
 
         let mut cluster = div().flex().items_center().gap_1();
+        if kind == ResourceKind::Image {
+            let prefill = if title == "<none>" || title.ends_with('…') {
+                id.to_string()
+            } else {
+                title.to_string()
+            };
+            let mut run_button = div()
+                .id(SharedString::from(format!("run-image-{id}")))
+                .size(px(24.))
+                .occlude()
+                .rounded_md()
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(if emphasized { 1.0 } else { 0.25 })
+                .child(svg().path("icons/run.svg").size(px(14.)).text_color(theme.text));
+            if pending.is_none() {
+                run_button = run_button
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.hover))
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.open_run(Some(prefill.clone()), window, cx);
+                        cx.notify();
+                    }));
+            }
+            cluster = cluster.child(run_button);
+        }
         for action in actions {
             let enabled = action_enabled(state, kind, action) && pending.is_none();
             let color = if enabled { theme.text } else { theme.text_dim };
@@ -1305,10 +1361,15 @@ impl RootView {
         let Some(run) = &mut self.mutations.run else {
             return;
         };
-        let Some(spec) = run.retry_spec() else {
+        if !run.pull_then_retry {
+            return;
+        }
+        let Some(spec) = run.submitted.clone() else {
             return;
         };
         run.pull_then_retry = false;
+        run.daemon_error = None;
+        run.missing_image = false;
         if let Some(service) = &self.service {
             service.request(Request::RunContainer { spec });
         }
@@ -1396,6 +1457,247 @@ impl RootView {
             );
         }
         Some(strip)
+    }
+
+    pub(crate) fn open_run(
+        &mut self,
+        prefill: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mutations.run.is_some() {
+            return;
+        }
+        self.mutations.pull_open = false;
+        self.host_menu_open = false;
+        self.mutations.run = Some(RunState {
+            form: RunForm {
+                image: prefill.unwrap_or_default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let focus = crate::ui::dialog::RunFocus::new(cx);
+        window.focus(&focus.image);
+        self.run_focus = Some(focus);
+    }
+
+    pub(crate) fn cancel_run(&mut self) {
+        let Some(run) = &self.mutations.run else {
+            return;
+        };
+        if run.submitting {
+            return;
+        }
+        self.mutations.run = None;
+        self.run_focus = None;
+    }
+
+    pub(crate) fn pull_run_image(&mut self) {
+        if self.mutations.pull.is_some() {
+            return;
+        }
+        let reference = match &self.mutations.run {
+            Some(run) => run.form.image.trim().to_string(),
+            None => return,
+        };
+        if reference.is_empty() {
+            return;
+        }
+        if let Some(run) = &mut self.mutations.run {
+            run.pull_then_retry = true;
+        }
+        self.start_pull(&reference, PullOrigin::RunRetry);
+    }
+
+    pub(crate) fn submit_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(run) = self.mutations.run.as_mut() else {
+            return;
+        };
+        if run.submitting {
+            return;
+        }
+        match build_run_spec(&run.form) {
+            Err(errors) => {
+                let first_field = errors.first().map(|error| error.field);
+                run.field_errors = errors;
+                run.daemon_error = None;
+                if let (Some(field), Some(focus)) = (first_field, self.run_focus.as_ref()) {
+                    if let Some(handle) = focus.handle(field) {
+                        window.focus(&handle);
+                    }
+                }
+            }
+            Ok(spec) => {
+                run.field_errors.clear();
+                run.submitted = Some(spec.clone());
+                run.submitting = true;
+                run.pull_then_retry = false;
+                run.daemon_error = None;
+                if let Some(service) = &self.service {
+                    service.request(Request::RunContainer { spec });
+                } else {
+                    run.submitting = false;
+                    run.daemon_error = Some("No host connection".to_string());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn run_field_text_mut(&mut self, field: RunField) -> Option<&mut String> {
+        let run = self.mutations.run.as_mut()?;
+        match field {
+            RunField::Image => Some(&mut run.form.image),
+            RunField::Name => Some(&mut run.form.name),
+            RunField::Command => Some(&mut run.form.command),
+            RunField::PortHost(index) => run.form.ports.get_mut(index).map(|port| &mut port.host),
+            RunField::PortContainer(index) => {
+                run.form.ports.get_mut(index).map(|port| &mut port.container)
+            }
+            RunField::EnvKey(index) => run.form.env.get_mut(index).map(|variable| &mut variable.key),
+            RunField::EnvValue(index) => {
+                run.form.env.get_mut(index).map(|variable| &mut variable.value)
+            }
+            RunField::MountSource(index) => {
+                run.form.mounts.get_mut(index).map(|mount| &mut mount.source)
+            }
+            RunField::MountTarget(index) => {
+                run.form.mounts.get_mut(index).map(|mount| &mut mount.target)
+            }
+        }
+    }
+
+    pub(crate) fn clear_run_field_error(&mut self, field: RunField) {
+        if let Some(run) = &mut self.mutations.run {
+            run.field_errors.retain(|error| error.field != field);
+            run.daemon_error = None;
+        }
+    }
+
+    pub(crate) fn add_run_port(&mut self, cx: &mut Context<Self>) {
+        if let Some(run) = &mut self.mutations.run {
+            if run.submitting {
+                return;
+            }
+            run.form.ports.push(crate::docker::actions::PortForm::default());
+        }
+        if let Some(focus) = &mut self.run_focus {
+            focus.add_port(cx);
+        }
+    }
+
+    pub(crate) fn remove_run_port(&mut self, index: usize) {
+        if let Some(run) = &mut self.mutations.run {
+            if run.submitting || index >= run.form.ports.len() {
+                return;
+            }
+            run.form.ports.remove(index);
+        }
+        if let Some(focus) = &mut self.run_focus {
+            focus.remove_port(index);
+        }
+    }
+
+    pub(crate) fn set_run_port_proto(&mut self, index: usize, proto: Proto) {
+        if let Some(port) = self
+            .mutations
+            .run
+            .as_mut()
+            .and_then(|run| run.form.ports.get_mut(index))
+        {
+            port.proto = proto;
+        }
+    }
+
+    pub(crate) fn add_run_env(&mut self, cx: &mut Context<Self>) {
+        if let Some(run) = &mut self.mutations.run {
+            if run.submitting {
+                return;
+            }
+            run.form.env.push(crate::docker::actions::EnvForm::default());
+        }
+        if let Some(focus) = &mut self.run_focus {
+            focus.add_env(cx);
+        }
+    }
+
+    pub(crate) fn remove_run_env(&mut self, index: usize) {
+        if let Some(run) = &mut self.mutations.run {
+            if run.submitting || index >= run.form.env.len() {
+                return;
+            }
+            run.form.env.remove(index);
+        }
+        if let Some(focus) = &mut self.run_focus {
+            focus.remove_env(index);
+        }
+    }
+
+    pub(crate) fn add_run_mount(&mut self, cx: &mut Context<Self>) {
+        if let Some(run) = &mut self.mutations.run {
+            if run.submitting {
+                return;
+            }
+            run.form.mounts.push(crate::docker::actions::MountForm::default());
+        }
+        if let Some(focus) = &mut self.run_focus {
+            focus.add_mount(cx);
+        }
+    }
+
+    pub(crate) fn remove_run_mount(&mut self, index: usize) {
+        if let Some(run) = &mut self.mutations.run {
+            if run.submitting || index >= run.form.mounts.len() {
+                return;
+            }
+            run.form.mounts.remove(index);
+        }
+        if let Some(focus) = &mut self.run_focus {
+            focus.remove_mount(index);
+        }
+    }
+
+    pub(crate) fn toggle_run_mount_read_only(&mut self, index: usize) {
+        if let Some(mount) = self
+            .mutations
+            .run
+            .as_mut()
+            .and_then(|run| run.form.mounts.get_mut(index))
+        {
+            mount.read_only = !mount.read_only;
+        }
+    }
+
+    fn apply_run_outcome(&mut self, outcome: RunOutcome) {
+        if outcome.close_dialog {
+            self.mutations.run = None;
+            self.run_focus = None;
+        }
+        if let Some(id) = outcome.select_container {
+            self.page = Page::Containers;
+            self.mutations.pending_select = Some(id);
+        }
+        if let Some(toast) = outcome.toast {
+            self.mutations.toast = Some(toast);
+        }
+        if outcome.refetch {
+            self.refresh();
+        }
+    }
+
+    fn render_run_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let run = self.mutations.run.clone()?;
+        let focus = self.run_focus.clone()?;
+        let theme = self.theme.clone();
+        let pulling = self.mutations.pull.is_some();
+        Some(crate::ui::dialog::run_dialog(
+            &run, &focus, pulling, &theme, window, cx,
+        ))
     }
 
     fn render_rail(&mut self, cx: &mut Context<Self>) -> Div {
@@ -1504,6 +1806,30 @@ impl RootView {
                 }));
         }
 
+        let run_dialog_open = self.mutations.run.is_some();
+        let run_color = if run_dialog_open { theme.text_dim } else { theme.text };
+        let mut run_button = div()
+            .id("run-button")
+            .h(px(28.))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .rounded_md()
+            .text_sm()
+            .text_color(run_color)
+            .child(svg().path("icons/run.svg").size(px(14.)).text_color(run_color))
+            .child("Run");
+        if !run_dialog_open {
+            run_button = run_button
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.hover))
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.open_run(None, window, cx);
+                    cx.notify();
+                }));
+        }
+
         div()
             .h(px(56.))
             .px_4()
@@ -1530,6 +1856,7 @@ impl RootView {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .when(self.page == Page::Containers, |this| this.child(run_button))
                     .when(self.page == Page::Images, |this| this.child(pull_button))
                     .child(search)
                     .child(
@@ -2173,6 +2500,9 @@ impl Render for RootView {
         }
         if let Some(confirm) = self.mutations.confirm.clone() {
             root = root.child(crate::ui::dialog::confirm(&confirm, &theme, cx));
+        }
+        if let Some(dialog) = self.render_run_dialog(window, cx) {
+            root = root.child(dialog);
         }
         if let Some(toast) = self.render_toast(cx) {
             root = root.child(toast);
