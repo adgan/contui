@@ -1108,7 +1108,7 @@ fn render_inspect_tree(nodes: &[InspectNode], theme: &Theme) -> impl IntoElement
             group = group.child(
                 div()
                     .text_xs()
-                    .font_family("Menlo")
+                    .font_family("JetBrains Mono")
                     .text_color(theme.text)
                     .child(value),
             );
@@ -1131,7 +1131,7 @@ fn render_inspect_tree(nodes: &[InspectNode], theme: &Theme) -> impl IntoElement
                     .min_w(px(0.))
                     .truncate()
                     .text_xs()
-                    .font_family("Menlo")
+                    .font_family("JetBrains Mono")
                     .text_color(theme.text)
                     .child(child.value.clone().unwrap_or_default()),
             );
@@ -1238,6 +1238,7 @@ impl Render for RootView {
             .size_full()
             .relative()
             .flex()
+            .font_family("Inter")
             .bg(theme.bg)
             .text_color(theme.text)
             .track_focus(&self.root_focus)

@@ -6,6 +6,7 @@ use gpui::{
 use crate::actions::{Back, FocusSearch, Refresh, ShowContainers, ShowImages, ShowVolumes};
 
 pub mod actions;
+pub mod assets;
 pub mod docker;
 pub mod theme;
 pub mod ui;
@@ -13,7 +14,22 @@ pub mod ui;
 use ui::root::RootView;
 
 pub fn run() {
-    Application::new().run(|cx: &mut App| {
+    Application::new()
+        .with_assets(assets::Assets)
+        .run(|cx: &mut App| {
+            {
+                use gpui::AssetSource as _;
+                let fonts: Vec<std::borrow::Cow<'static, [u8]>> = [
+                    "fonts/Inter.ttf",
+                    "fonts/JetBrainsMono.ttf",
+                ]
+                .into_iter()
+                .filter_map(|path| assets::Assets.load(path).ok().flatten())
+                .collect();
+                if !fonts.is_empty() {
+                    let _ = cx.text_system().add_fonts(fonts);
+                }
+            }
         cx.bind_keys([
             KeyBinding::new("cmd-1", ShowContainers, None),
             KeyBinding::new("cmd-2", ShowImages, None),

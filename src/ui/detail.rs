@@ -51,7 +51,7 @@ pub fn render_logs(lines: &[LogLine], theme: &Theme) -> impl IntoElement {
         .flex()
         .flex_col()
         .text_xs()
-        .font_family("Menlo");
+        .font_family("JetBrains Mono");
 
     if lines.is_empty() {
         return container.child(
