@@ -485,11 +485,12 @@ impl RootView {
                 table.move_selection(1);
                 cx.notify();
             }
-            "escape" => {
-                if self.detail.is_some() {
-                    self.close_detail();
+            "enter" => {
+                if self.detail.is_none() {
+                    if let Some(row) = self.current_table().selected {
+                        self.open_detail(row);
+                    }
                 }
-                self.host_menu_open = false;
                 cx.notify();
             }
             _ => {}
@@ -854,14 +855,7 @@ impl RootView {
                             .child(self.active_host_name()),
                     ),
             )
-            .when_some(self.last_error.clone(), |this, error| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.error)
-                        .child(error),
-                )
-            })
+
     }
 
     fn render_host_menu(&mut self, cx: &mut Context<Self>) -> Option<Div> {
@@ -1047,18 +1041,24 @@ impl RootView {
         .h_full();
 
         let body: gpui::AnyElement = if visible_count == 0 {
+            let (title, detail) = crate::ui::empty::message_for(
+                self.page,
+                &self.status,
+                &self.current_table().query,
+            )
+            .unwrap_or_else(|| (self.page.empty_title().to_string(), String::new()));
             div()
                 .flex_1()
+                .min_h(px(0.))
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
-                .text_sm()
-                .text_color(theme.text_dim)
-                .child(if self.current_table().query.is_empty() {
-                    self.page.empty_title().to_string()
-                } else {
-                    format!("No matches for \"{}\"", self.current_table().query)
-                })
+                .gap_1()
+                .px_8()
+                .text_center()
+                .child(div().text_sm().text_color(theme.text).child(title))
+                .child(div().text_xs().text_color(theme.text_dim).child(detail))
                 .into_any_element()
         } else {
             div().flex_1().min_h(px(0.)).child(list).into_any_element()
@@ -1190,15 +1190,48 @@ impl Render for RootView {
         } else {
             let header = self.render_header(cx);
             let table = self.render_table(cx);
-            div()
+            let mut column = div()
                 .flex_1()
                 .min_w(px(0.))
                 .h_full()
                 .flex()
                 .flex_col()
-                .child(header)
-                .child(table)
-                .into_any_element()
+                .child(header);
+
+            if let Some(error) = self.last_error.clone() {
+                column = column.child(
+                    div()
+                        .h(px(32.))
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .bg(theme.panel)
+                        .border_b_1()
+                        .border_color(theme.error)
+                        .text_xs()
+                        .text_color(theme.error)
+                        .child(div().truncate().child(error))
+                        .child(
+                            div()
+                                .id("retry")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme.hover))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.last_error = None;
+                                    this.refresh();
+                                    cx.notify();
+                                }))
+                                .child("Retry"),
+                        ),
+                );
+            }
+
+            column.child(table).into_any_element()
         };
 
         let mut root = div()
@@ -1208,7 +1241,35 @@ impl Render for RootView {
             .bg(theme.bg)
             .text_color(theme.text)
             .track_focus(&self.root_focus)
-            .on_key_down(cx.listener(|this, event, window, cx| this.on_root_key(event, window, cx)));
+            .on_key_down(cx.listener(|this, event, window, cx| this.on_root_key(event, window, cx)))
+            .on_action(cx.listener(|this, _: &crate::actions::ShowContainers, _window, cx| {
+                this.switch_page(Page::Containers);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::ShowImages, _window, cx| {
+                this.switch_page(Page::Images);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::ShowVolumes, _window, cx| {
+                this.switch_page(Page::Volumes);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::Refresh, _window, cx| {
+                this.refresh();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::FocusSearch, window, cx| {
+                window.focus(&this.search_focus);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::Back, _window, cx| {
+                if this.detail.is_some() {
+                    this.close_detail();
+                } else {
+                    this.host_menu_open = false;
+                }
+                cx.notify();
+            }));
 
         root = root.child(rail).child(content);
 
