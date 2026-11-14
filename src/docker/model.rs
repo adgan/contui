@@ -75,6 +75,7 @@ pub struct ImageRow {
     pub repository_tag: SharedString,
     pub size: i64,
     pub size_label: SharedString,
+    pub created: DateTime<Utc>,
     pub created_label: SharedString,
     pub in_use: bool,
 }
@@ -99,6 +100,7 @@ impl ImageRow {
             repository_tag: truncate(&repository_tag, 48).into(),
             size: image.size,
             size_label: format_bytes(image.size).into(),
+            created,
             created_label: format_ago(created, now).into(),
             in_use,
         }

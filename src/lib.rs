@@ -1,13 +1,11 @@
 use gpui::prelude::*;
-use gpui::{
-    App, Application, Bounds, Context, Render, Window, WindowBounds, WindowOptions, div, px, size,
-};
+use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, px, size};
 
 pub mod docker;
 pub mod theme;
 pub mod ui;
 
-use theme::Theme;
+use ui::root::RootView;
 
 pub fn run() {
     Application::new().run(|cx: &mut App| {
@@ -22,27 +20,9 @@ pub fn run() {
                 }),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| RootPlaceholder { theme: Theme::dark() }),
+            |_, cx| cx.new(RootView::new),
         )
         .unwrap();
         cx.activate(true);
     });
-}
-
-struct RootPlaceholder {
-    theme: Theme,
-}
-
-impl Render for RootPlaceholder {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .justify_center()
-            .items_center()
-            .bg(self.theme.bg)
-            .text_color(self.theme.text)
-            .text_xl()
-            .child("Dockyard")
-    }
 }
