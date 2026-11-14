@@ -293,6 +293,13 @@ must work in **both** an unbundled binary and a bundle. If the transparent title
 menu behaves differently unbundled, the unbundled path gets a plain titlebar and we do
 not spend time on parity; the bundle is the real artifact.
 
+**Distribution, added 2026-11-14.** v1 still ships via `just bundle`, and distribution is
+a public Homebrew tap at `github.com/adgan/homebrew-tap` (installed as `adgan/tap`). The
+formula is HEAD-only and builds from source until `v0.1.0` is tagged; bottles and a cask
+for `/Applications` follow in plan Task 10. See
+`2026-11-14-homebrew-tap-design.md` for the tap's own design, including why there is no
+cask yet and why `brew trust` is part of the install steps.
+
 ## Testing
 
 - **Unit tests** (no daemon needed): endpoint resolution against a temp `DOCKER_HOST`,
