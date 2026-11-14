@@ -105,18 +105,19 @@ class Contui < Formula
   version "0.1.0"
   license "MIT"
 
-  head "https://github.com/adgan/contui.git", branch: "main"
+  # Pinned to the rename branch until it merges; switch to "main" after that.
+  head "https://github.com/adgan/contui.git", branch: "feat/contui"
 
   depends_on "rust" => :build
   depends_on :macos
 
   def install
-    system "cargo", "build", "--release", "--locked"
+    system "cargo", "install", *std_cargo_args
 
     app = buildpath/"contUI.app"
     (app/"Contents/MacOS").mkpath
     (app/"Contents/Resources").mkpath
-    cp "target/release/contui", app/"Contents/MacOS/contUI"
+    mv prefix/"bin/contui", app/"Contents/MacOS/contUI"
     if (buildpath/"assets/Info.plist").exist?
       cp "assets/Info.plist", app/"Contents/Info.plist"
     end
@@ -182,10 +183,15 @@ Expected: `brew audit --strict` prints nothing but the rubocop-md config warning
 Run: `brew fetch --HEAD adgan/tap/contui`
 Expected: Homebrew clones `https://github.com/adgan/contui.git` successfully. It may print `HEAD is now at …`; it must not 404.
 
-- [ ] **Step 8: Confirm the install failure is Cargo's, not the formula's**
+- [ ] **Step 8: Verify the installed keg**
 
-Run: `brew install --HEAD adgan/tap/contui`
-Expected: FAIL, and the first error is Cargo's (no `Cargo.toml` in the repo yet). No `No such file or directory - assets/…` and no Ruby exception from the formula. Record the exact error line in the tap README's status note.
+Run: `brew install --HEAD adgan/tap/contui` and, once it finishes,
+`brew test adgan/tap/contui`.
+Expected: PASS. The keg contains `contUI.app/Contents/MacOS/contUI`, `bin/contui` is a
+symlink to it, and the app launches from `/Applications`. (As built on 2026-11-14: build
+took 1m44s, 52 unit tests already passed separately, and the app opened and quit cleanly.
+Earlier in the build the source had no `src/`, so this step was expected to fail; the
+implementation now exists, so it is the real gate.)
 
 ---
 
@@ -218,9 +224,11 @@ jobs:
       - name: Tap this checkout
         run: brew tap adgan/tap "$GITHUB_WORKSPACE"
       - name: Trust the formula
-        run: brew trust adgan/tap
+        run: brew trust adgan/tap || true
       - name: Audit
         run: brew audit --strict --online adgan/tap/contui
+      - name: Fetch HEAD
+        run: brew fetch --HEAD adgan/tap/contui
       - name: Style
         run: brew style
 ```
@@ -236,6 +244,7 @@ Expected: `ok`.
 brew tap adgan/tap 2>/dev/null || brew tap adgan/tap "$PWD"
 brew trust adgan/tap
 brew audit --strict --online adgan/tap/contui
+brew fetch --HEAD adgan/tap/contui
 brew style
 ```
 

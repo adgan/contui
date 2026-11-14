@@ -20,6 +20,13 @@ First version scope: **containers, images and volumes**, read-only.
 - `ssh://` hosts are listed but not connected; no passphrase prompt yet.
 - No Compose grouping, no exec shell, no builds, no Kubernetes view.
 
+## Install with Homebrew
+
+A public tap carries the app: `brew install --HEAD adgan/tap/contui`. The
+[tap README](https://github.com/adgan/homebrew-tap) covers trust, launch, upgrade and
+uninstall. It is a source build until the first tagged release, so it needs Rust and the
+Xcode Command Line Tools.
+
 ## Build and run
 
 Requirements: Rust stable (1.99+), Xcode Command Line Tools, and a running Docker engine (tested against Rancher Desktop).

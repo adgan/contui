@@ -97,18 +97,20 @@ adgan/homebrew-tap
 
 - `desc`, `homepage` (`adgan/contui`), `license "MIT"`, `version "0.1.0"` (documentation
   only until a stable url exists).
-- `head "https://github.com/adgan/contui.git", branch: "main"`.
+- `head "https://github.com/adgan/contui.git", branch: "feat/contui"` while the rename
+  branch is unmerged; the release checklist flips it to `branch: "main"`.
 - `depends_on "rust" => :build`, `depends_on :macos`.
-- `install`: `cargo build --release`; assemble `contUI.app/Contents/{MacOS,Resources}`
-  with the binary as `Contents/MacOS/contUI`; `prefix.install "contUI.app"`;
-  `bin.install_symlink prefix/"contUI.app/Contents/MacOS/contUI" => "contui"`;
-  ad-hoc `codesign --force --deep --sign -`.
+- `install`: `cargo install *std_cargo_args` (Homebrew rejects `cargo build`), move
+  `prefix/bin/contui` into `contUI.app/Contents/MacOS/contUI`, `prefix.install
+  "contUI.app"`, `bin.install_symlink prefix/"contUI.app/Contents/MacOS/contUI" =>
+  "contui"`, ad-hoc `codesign --force --deep --sign -`.
 - `caveats`: how to symlink the bundle into `/Applications`, and that Gatekeeper may
   require a right-click-open because there is no notarization.
 - `test`: assert the bundle executable exists and is executable. Never launch the GUI.
 
 CI (`audit.yml`) runs on `macos-latest`: checkout, `brew tap adgan/tap "$GITHUB_WORKSPACE"`,
-`brew audit --strict --online adgan/tap/contui`, `brew style`. It does not install.
+`brew trust adgan/tap`, `brew audit --strict --online adgan/tap/contui`,
+`brew fetch --HEAD adgan/tap/contui`, `brew style`. It does not install.
 
 Parent repo changes: one new plan task (Task 10) covering the tag, stable url, bottle, and
 cask follow-ups; one line in Task 9's README section pointing at the tap.
