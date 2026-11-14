@@ -1,7 +1,290 @@
+use dockyard::docker::actions::{ContainerAction, PortSpec, RunSpec};
 use dockyard::docker::endpoint::discover;
-use dockyard::docker::service::{DockerService, Request, Response};
+use dockyard::docker::service::{DockerService, PullOrigin, Request, Response};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+fn connect() -> (DockerService, async_channel::Receiver<Response>) {
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let home = std::env::var("HOME").map(PathBuf::from).unwrap();
+    let discovery = discover(&env, &home);
+    let active = discovery.active.clone().expect("an active host");
+    let host = discovery
+        .hosts
+        .into_iter()
+        .find(|h| h.id == active)
+        .expect("active host in list");
+    DockerService::connect(host).expect("connect to docker")
+}
+
+/// Skips status, event and detail traffic and returns the first matching
+/// mutation or snapshot response.
+fn wait_for(
+    responses: &async_channel::Receiver<Response>,
+    what: &str,
+    pred: impl Fn(&Response) -> bool,
+) -> Response {
+    loop {
+        let response = responses
+            .recv_blocking()
+            .unwrap_or_else(|err| panic!("channel closed while waiting for {what}: {err}"));
+        match &response {
+            Response::Status(_)
+            | Response::HostStatuses(_)
+            | Response::Dirty { .. }
+            | Response::PullProgress { .. }
+            | Response::Inspect { .. }
+            | Response::Logs { .. } => continue,
+            _ => {}
+        }
+        if pred(&response) {
+            return response;
+        }
+        panic!("while waiting for {what}, got {response:?}");
+    }
+}
+
+fn action_error(responses: &async_channel::Receiver<Response>, what: &str) -> Option<String> {
+    match wait_for(responses, what, |response| {
+        matches!(response, Response::ActionDone { .. })
+    }) {
+        Response::ActionDone { error, .. } => error,
+        _ => unreachable!(),
+    }
+}
+
+fn run_spec(name: &str, host_port: Option<u16>) -> RunSpec {
+    RunSpec {
+        image: "alpine:3.20".into(),
+        name: Some(name.into()),
+        command: Some(vec!["sh".into(), "-c".into(), "sleep 60".into()]),
+        ports: host_port
+            .map(|port| PortSpec {
+                host: Some(port),
+                container: 80,
+                udp: false,
+            })
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn cleanup_test_containers(
+    service: &DockerService,
+    responses: &async_channel::Receiver<Response>,
+) {
+    service.request(Request::FetchAll);
+    let snapshot = match wait_for(responses, "snapshot for cleanup", |response| {
+        matches!(response, Response::Snapshot(_))
+    }) {
+        Response::Snapshot(snapshot) => snapshot,
+        _ => return,
+    };
+    for container in snapshot.containers {
+        let name = container.name.to_string();
+        if name.starts_with("dockyard-live-") || name.starts_with("dockyard-port-") {
+            service.request(Request::RemoveContainer {
+                id: container.id,
+                force: true,
+            });
+            let _ = action_error(responses, "cleanup remove");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a running docker daemon"]
+fn pull_run_stop_restart_and_force_remove_round_trip() {
+    let (service, responses) = connect();
+    cleanup_test_containers(&service, &responses);
+
+    service.request(Request::PullImage {
+        reference: "alpine:3.20".into(),
+        origin: PullOrigin::Header,
+    });
+    let pulled = wait_for(&responses, "pull alpine:3.20", |response| {
+        matches!(response, Response::PullDone { .. })
+    });
+    if let Response::PullDone {
+        error: Some(error), ..
+    } = pulled
+    {
+        eprintln!("skipping live run test: pull failed: {error}");
+        return;
+    }
+
+    let name = format!("dockyard-live-{}", std::process::id());
+    service.request(Request::RunContainer {
+        spec: run_spec(&name, None),
+    });
+    let created = wait_for(&responses, "run", |response| {
+        matches!(
+            response,
+            Response::ContainerCreated { .. } | Response::RunFailed { .. }
+        )
+    });
+    let id = match created {
+        Response::ContainerCreated { id, .. } => id,
+        Response::RunFailed { message, .. } => panic!("run failed: {message}"),
+        _ => unreachable!(),
+    };
+
+    service.request(Request::ContainerAction {
+        id: id.clone(),
+        action: ContainerAction::Stop,
+    });
+    assert_eq!(action_error(&responses, "stop"), None);
+
+    service.request(Request::ContainerAction {
+        id: id.clone(),
+        action: ContainerAction::Restart,
+    });
+    assert_eq!(action_error(&responses, "restart"), None);
+
+    service.request(Request::RemoveContainer {
+        id: id.clone(),
+        force: false,
+    });
+    let blocked = action_error(&responses, "remove running container").expect("a running container refuses a plain remove");
+    assert!(
+        blocked.to_lowercase().contains("running"),
+        "unexpected removal error: {blocked}"
+    );
+
+    service.request(Request::RemoveContainer { id, force: true });
+    assert_eq!(action_error(&responses, "force remove"), None);
+}
+
+#[test]
+#[ignore = "requires a running docker daemon"]
+fn run_with_a_taken_host_port_keeps_the_created_container() {
+    let (service, responses) = connect();
+    cleanup_test_containers(&service, &responses);
+
+    service.request(Request::PullImage {
+        reference: "alpine:3.20".into(),
+        origin: PullOrigin::Header,
+    });
+    let pulled = wait_for(&responses, "pull alpine:3.20", |response| {
+        matches!(response, Response::PullDone { .. })
+    });
+    if let Response::PullDone {
+        error: Some(error), ..
+    } = pulled
+    {
+        eprintln!("skipping live port test: pull failed: {error}");
+        return;
+    }
+
+    let first_name = format!("dockyard-port-a-{}", std::process::id());
+    service.request(Request::RunContainer {
+        spec: run_spec(&first_name, Some(45999)),
+    });
+    let first = wait_for(&responses, "first run", |response| {
+        matches!(
+            response,
+            Response::ContainerCreated { .. } | Response::RunFailed { .. }
+        )
+    });
+    let first_id = match first {
+        Response::ContainerCreated { id, .. } => id,
+        Response::RunFailed { message, .. } => {
+            eprintln!("skipping live port test: host port 45999 unavailable: {message}");
+            return;
+        }
+        _ => unreachable!(),
+    };
+
+    let second_name = format!("dockyard-port-b-{}", std::process::id());
+    service.request(Request::RunContainer {
+        spec: run_spec(&second_name, Some(45999)),
+    });
+    let second = wait_for(&responses, "second run", |response| {
+        matches!(
+            response,
+            Response::ContainerCreated { .. } | Response::RunFailed { .. }
+        )
+    });
+    let second_id = match second {
+        Response::RunFailed {
+            message,
+            created: Some(id),
+            ..
+        } => {
+            assert!(
+                message.contains("port is already allocated") || message.contains("address already in use"),
+                "unexpected start error: {message}"
+            );
+            id
+        }
+        Response::RunFailed { message, .. } => {
+            panic!("create failed instead of start: {message}")
+        }
+        Response::ContainerCreated { .. } => panic!("second container should not start"),
+        _ => unreachable!(),
+    };
+
+    service.request(Request::RemoveContainer {
+        id: first_id,
+        force: true,
+    });
+    assert_eq!(action_error(&responses, "remove first"), None);
+    service.request(Request::RemoveContainer {
+        id: second_id,
+        force: true,
+    });
+    assert_eq!(action_error(&responses, "remove second"), None);
+}
+
+#[test]
+#[ignore = "requires a running docker daemon"]
+fn list_requests_are_answered_while_a_pull_runs() {
+    let (service, responses) = connect();
+    let started = Instant::now();
+
+    service.request(Request::PullImage {
+        reference: "debian:bookworm-slim".into(),
+        origin: PullOrigin::Header,
+    });
+    service.request(Request::FetchAll);
+
+    let mut snapshot_at = None;
+    let mut pull_done = false;
+    let mut pull_error = None;
+    let deadline = started + Duration::from_secs(120);
+
+    while (snapshot_at.is_none() || !pull_done) && Instant::now() < deadline {
+        while let Ok(response) = responses.try_recv() {
+            match response {
+                Response::Snapshot(_) => {
+                    snapshot_at.get_or_insert_with(Instant::now);
+                }
+                Response::PullDone { error, .. } => {
+                    pull_done = true;
+                    pull_error = error;
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let snapshot_at = snapshot_at.expect("a snapshot while a pull runs");
+    assert!(
+        snapshot_at.duration_since(started) <= Duration::from_secs(2),
+        "snapshot took {:?} while a pull was running",
+        snapshot_at.duration_since(started)
+    );
+    assert!(
+        pull_done,
+        "pull did not finish; last error: {pull_error:?}"
+    );
+    if let Some(error) = pull_error {
+        eprintln!("pull reported an error after the snapshot: {error}");
+    }
+}
 
 #[test]
 #[ignore = "requires a running docker daemon"]

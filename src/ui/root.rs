@@ -434,6 +434,11 @@ impl RootView {
                     }
                 }
             }
+            Response::ActionDone { .. }
+            | Response::PullProgress { .. }
+            | Response::PullDone { .. }
+            | Response::ContainerCreated { .. }
+            | Response::RunFailed { .. } => {}
         }
     }
 

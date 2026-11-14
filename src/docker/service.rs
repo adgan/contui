@@ -1,3 +1,7 @@
+use crate::docker::actions::{
+    classify_run_error, clean_error, run_body, split_image_reference, ActionKind, ContainerAction,
+    RunSpec, Target,
+};
 use crate::docker::endpoint::{
     discover, EndpointKind, HostInfo, HostStatus, TlsFiles,
 };
@@ -9,14 +13,29 @@ use crate::docker::model::{
 use async_channel::{Receiver, Sender};
 use bollard::Docker;
 use bollard::query_parameters::{
+    CreateContainerOptionsBuilder, CreateImageOptions, CreateImageOptionsBuilder,
     ListContainersOptionsBuilder, ListImagesOptionsBuilder, ListVolumesOptionsBuilder,
-    LogsOptionsBuilder,
+    LogsOptionsBuilder, RemoveContainerOptions, RemoveContainerOptionsBuilder,
+    RemoveImageOptionsBuilder, RemoveVolumeOptionsBuilder, StopContainerOptions,
+    StopContainerOptionsBuilder,
 };
 use chrono::Utc;
 use futures_util::{join, StreamExt};
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::runtime::Runtime;
+
+/// Bollard's connection timeout is a per-read/write socket timeout, not a
+/// connect timeout. It must outlast Docker's 10s stop grace and the 60s pull
+/// idle cap, or a quiet-but-healthy operation is reported as transport failure.
+const CLIENT_TIMEOUT_SECS: u64 = 65;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullOrigin {
+    Header,
+    RunRetry,
+}
 
 #[derive(Clone, Debug)]
 pub enum Request {
@@ -28,6 +47,28 @@ pub enum Request {
     },
     Logs {
         id: String,
+    },
+    ContainerAction {
+        id: String,
+        action: ContainerAction,
+    },
+    RemoveContainer {
+        id: String,
+        force: bool,
+    },
+    RemoveImage {
+        id: String,
+        force: bool,
+    },
+    RemoveVolume {
+        name: String,
+    },
+    PullImage {
+        reference: String,
+        origin: PullOrigin,
+    },
+    RunContainer {
+        spec: RunSpec,
     },
 }
 
@@ -53,6 +94,52 @@ pub enum Response {
         what: String,
         message: String,
     },
+    ActionDone {
+        target: Target,
+        action: ActionKind,
+        error: Option<String>,
+    },
+    PullProgress {
+        origin: PullOrigin,
+        reference: String,
+        layer: Option<String>,
+        status: String,
+        detail: Option<(u64, u64)>,
+    },
+    PullDone {
+        origin: PullOrigin,
+        reference: String,
+        error: Option<String>,
+    },
+    ContainerCreated {
+        id: String,
+        warnings: Vec<String>,
+    },
+    RunFailed {
+        message: String,
+        missing_image: bool,
+        created: Option<String>,
+    },
+}
+
+pub fn remove_container_options(force: bool) -> RemoveContainerOptions {
+    RemoveContainerOptionsBuilder::new()
+        .force(force)
+        .v(false)
+        .build()
+}
+
+pub fn stop_options() -> StopContainerOptions {
+    StopContainerOptionsBuilder::new().t(10).build()
+}
+
+pub fn pull_options(reference: &str) -> CreateImageOptions {
+    let (repo, tag) = split_image_reference(reference);
+    let builder = CreateImageOptionsBuilder::new().from_image(&repo);
+    match tag {
+        Some(tag) => builder.tag(&tag).build(),
+        None => builder.build(),
+    }
 }
 
 pub struct DockerService {
@@ -103,8 +190,8 @@ impl Drop for DockerService {
 fn build_docker(host: &HostInfo) -> Result<Docker, String> {
     let version = bollard::API_DEFAULT_VERSION;
     match host.endpoint.kind {
-        EndpointKind::Unix => Docker::connect_with_unix(&host.endpoint.address, 5, version),
-        EndpointKind::Http => Docker::connect_with_http(&host.endpoint.address, 5, version),
+        EndpointKind::Unix => Docker::connect_with_unix(&host.endpoint.address, CLIENT_TIMEOUT_SECS, version),
+        EndpointKind::Http => Docker::connect_with_http(&host.endpoint.address, CLIENT_TIMEOUT_SECS, version),
         EndpointKind::Tls => {
             let tls = host
                 .tls
@@ -123,9 +210,19 @@ fn connect_tls(address: &str, tls: &TlsFiles) -> Result<Docker, bollard::errors:
         &tls.key,
         &tls.cert,
         &tls.ca,
-        5,
+        CLIENT_TIMEOUT_SECS,
         bollard::API_DEFAULT_VERSION,
     )
+}
+
+fn mutation_error(
+    result: Result<Result<(), bollard::errors::Error>, tokio::time::error::Elapsed>,
+) -> Option<String> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(err)) => Some(clean_error(&err)),
+        Err(_) => Some("timed out after 30s".to_string()),
+    }
 }
 
 async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Response>) {
@@ -183,6 +280,258 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                         .await;
                 }
             },
+            // Implemented in the next step of this task.
+            Request::ContainerAction { id, action } => {
+                let docker = docker.clone();
+                let resp_tx = resp_tx.clone();
+                tokio::spawn(async move {
+                    let kind = ActionKind::for_container(action);
+                    let target = Target {
+                        kind: ResourceKind::Container,
+                        id: id.clone(),
+                    };
+                    let call = async {
+                        match action {
+                            ContainerAction::Start => docker.start_container(&id, None).await,
+                            ContainerAction::Stop => {
+                                docker.stop_container(&id, Some(stop_options())).await
+                            }
+                            ContainerAction::Restart => docker.restart_container(&id, None).await,
+                        }
+                    };
+                    let error = mutation_error(
+                        tokio::time::timeout(Duration::from_secs(30), call).await,
+                    );
+                    let _ = resp_tx
+                        .send(Response::ActionDone {
+                            target,
+                            action: kind,
+                            error,
+                        })
+                        .await;
+                });
+            }
+            Request::RemoveContainer { id, force } => {
+                let docker = docker.clone();
+                let resp_tx = resp_tx.clone();
+                tokio::spawn(async move {
+                    let target = Target {
+                        kind: ResourceKind::Container,
+                        id: id.clone(),
+                    };
+                    let error = mutation_error(
+                        tokio::time::timeout(
+                            Duration::from_secs(30),
+                            docker.remove_container(&id, Some(remove_container_options(force))),
+                        )
+                        .await,
+                    );
+                    let _ = resp_tx
+                        .send(Response::ActionDone {
+                            target,
+                            action: ActionKind::Remove,
+                            error,
+                        })
+                        .await;
+                });
+            }
+            Request::RemoveImage { id, force } => {
+                let docker = docker.clone();
+                let resp_tx = resp_tx.clone();
+                tokio::spawn(async move {
+                    let target = Target {
+                        kind: ResourceKind::Image,
+                        id: id.clone(),
+                    };
+                    let error = match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        docker.remove_image(
+                            &id,
+                            Some(
+                                RemoveImageOptionsBuilder::new()
+                                    .force(force)
+                                    .noprune(false)
+                                    .build(),
+                            ),
+                            None,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => None,
+                        Ok(Err(err)) => Some(clean_error(&err)),
+                        Err(_) => Some("timed out after 30s".to_string()),
+                    };
+                    let _ = resp_tx
+                        .send(Response::ActionDone {
+                            target,
+                            action: ActionKind::Remove,
+                            error,
+                        })
+                        .await;
+                });
+            }
+            Request::RemoveVolume { name } => {
+                let docker = docker.clone();
+                let resp_tx = resp_tx.clone();
+                tokio::spawn(async move {
+                    let target = Target {
+                        kind: ResourceKind::Volume,
+                        id: name.clone(),
+                    };
+                    let error = mutation_error(
+                        tokio::time::timeout(
+                            Duration::from_secs(30),
+                            docker.remove_volume(
+                                &name,
+                                Some(RemoveVolumeOptionsBuilder::new().force(false).build()),
+                            ),
+                        )
+                        .await,
+                    );
+                    let _ = resp_tx
+                        .send(Response::ActionDone {
+                            target,
+                            action: ActionKind::Remove,
+                            error,
+                        })
+                        .await;
+                });
+            }
+            Request::PullImage { reference, origin } => {
+                let docker = docker.clone();
+                let resp_tx = resp_tx.clone();
+                tokio::spawn(async move {
+                    let mut stream =
+                        docker.create_image(Some(pull_options(&reference)), None, None);
+                    loop {
+                        match tokio::time::timeout(Duration::from_secs(60), stream.next()).await {
+                            Err(_) => {
+                                let _ = resp_tx
+                                    .send(Response::PullDone {
+                                        origin,
+                                        reference,
+                                        error: Some("pull stalled for 60s".to_string()),
+                                    })
+                                    .await;
+                                return;
+                            }
+                            Ok(None) => {
+                                let _ = resp_tx
+                                    .send(Response::PullDone {
+                                        origin,
+                                        reference,
+                                        error: None,
+                                    })
+                                    .await;
+                                return;
+                            }
+                            Ok(Some(Err(err))) => {
+                                let _ = resp_tx
+                                    .send(Response::PullDone {
+                                        origin,
+                                        reference,
+                                        error: Some(clean_error(&err)),
+                                    })
+                                    .await;
+                                return;
+                            }
+                            Ok(Some(Ok(info))) => {
+                                let detail = info.progress_detail.and_then(|progress| {
+                                    match (progress.current, progress.total) {
+                                        (Some(current), Some(total)) if total > 0 => {
+                                            Some((current as u64, total as u64))
+                                        }
+                                        _ => None,
+                                    }
+                                });
+                                let _ = resp_tx
+                                    .send(Response::PullProgress {
+                                        origin,
+                                        reference: reference.clone(),
+                                        layer: info.id,
+                                        status: info.status.unwrap_or_default(),
+                                        detail,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                });
+            }
+            Request::RunContainer { spec } => {
+                let docker = docker.clone();
+                let resp_tx = resp_tx.clone();
+                tokio::spawn(async move {
+                    let options = spec.name.as_deref().map(|name| {
+                        CreateContainerOptionsBuilder::new().name(name).build()
+                    });
+                    let body = run_body(&spec);
+                    let created = match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        docker.create_container(options, body),
+                    )
+                    .await
+                    {
+                        Ok(Ok(response)) => response,
+                        Ok(Err(err)) => {
+                            let failure = classify_run_error(&err, None);
+                            let _ = resp_tx
+                                .send(Response::RunFailed {
+                                    message: failure.message,
+                                    missing_image: failure.missing_image,
+                                    created: None,
+                                })
+                                .await;
+                            return;
+                        }
+                        Err(_) => {
+                            let _ = resp_tx
+                                .send(Response::RunFailed {
+                                    message: "timed out after 30s".to_string(),
+                                    missing_image: false,
+                                    created: None,
+                                })
+                                .await;
+                            return;
+                        }
+                    };
+
+                    let id = created.id;
+                    let warnings = created.warnings;
+                    match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        docker.start_container(&id, None),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            let _ = resp_tx
+                                .send(Response::ContainerCreated { id, warnings })
+                                .await;
+                        }
+                        Ok(Err(err)) => {
+                            let failure = classify_run_error(&err, Some(id.clone()));
+                            let _ = resp_tx
+                                .send(Response::RunFailed {
+                                    message: failure.message,
+                                    missing_image: failure.missing_image,
+                                    created: Some(id),
+                                })
+                                .await;
+                        }
+                        Err(_) => {
+                            let _ = resp_tx
+                                .send(Response::RunFailed {
+                                    message: "created but did not start within 30s".to_string(),
+                                    missing_image: false,
+                                    created: Some(id),
+                                })
+                                .await;
+                        }
+                    }
+                });
+            }
         }
     }
 }
@@ -359,6 +708,33 @@ async fn event_loop(docker: Docker, resp_tx: Sender<Response>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_options_keep_anonymous_volumes() {
+        let forced = remove_container_options(true);
+        assert!(forced.force);
+        assert!(
+            !forced.v,
+            "v(true) would delete anonymous volumes behind the dialog's back"
+        );
+        assert!(!remove_container_options(false).force);
+    }
+
+    #[test]
+    fn stop_options_use_a_ten_second_grace() {
+        assert_eq!(stop_options().t, Some(10));
+    }
+
+    #[test]
+    fn pull_options_split_registry_tag_and_digest() {
+        let opts = pull_options("registry:5000/team/app:1.2");
+        assert_eq!(opts.from_image.as_deref(), Some("registry:5000/team/app"));
+        assert_eq!(opts.tag.as_deref(), Some("1.2"));
+
+        let digest = pull_options("app@sha256:abc");
+        assert_eq!(digest.from_image.as_deref(), Some("app@sha256:abc"));
+        assert_eq!(digest.tag, None);
+    }
 
     #[test]
     fn liveness_failure_keeps_auth_failed_and_the_reason() {
