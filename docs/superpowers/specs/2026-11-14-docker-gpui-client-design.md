@@ -1,7 +1,7 @@
 # Dockyard — a fast Docker client in GPUI — design
 
 Date: 2026-11-14
-Status: awaiting approval
+Status: approved 2026-11-14
 
 ## Intent
 
@@ -354,6 +354,5 @@ Two scope calls that would change the build if they are wrong:
    running container. Deferred to v1.1; v1 shows Name · State · Image · Ports · Created.
 2. **Remote hosts.** v1 covers unix sockets and `tcp://`/`http://` including TLS via
    `DOCKER_CERT_PATH`. `ssh://` hosts are listed but not connected, and there is no
-   passphrase prompt — full SSH is v1.1. If "any Docker host" for you means "my remote
-   server over SSH, today", this needs a keychain-backed passphrase prompt and moves
-   into v1.
+   passphrase prompt — full SSH is v1.1. **Confirmed 2026-11-14: no SSH host is needed
+   in v1.**
