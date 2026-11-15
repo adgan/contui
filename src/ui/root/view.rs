@@ -185,6 +185,18 @@ impl RootView {
             },
         ));
 
+        let copy_title = title.clone();
+        panel = panel.child(row_menu_item(
+            "Copy name",
+            theme.text_dim,
+            &theme,
+            cx,
+            move |this, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_title.clone()));
+                this.mutations.row_menu = None;
+            },
+        ));
+
         if menu.kind == ResourceKind::Container {
             for action in [ActionKind::Start, ActionKind::Stop, ActionKind::Restart] {
                 if action_enabled(state, menu.kind, action) {
