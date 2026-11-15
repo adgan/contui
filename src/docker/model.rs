@@ -27,7 +27,6 @@ pub enum ResourceKind {
 #[derive(Clone, Debug)]
 pub struct ContainerRow {
     pub id: String,
-    pub short_id: String,
     pub name: SharedString,
     pub state: ContainerState,
     pub status: SharedString,
@@ -65,7 +64,6 @@ impl ContainerRow {
 
         Self {
             id,
-            short_id,
             name: truncate(&name, 48).into(),
             state: container_state(summary.state.unwrap_or(ContainerSummaryStateEnum::EMPTY)),
             status: summary.status.unwrap_or_default().into(),
@@ -82,7 +80,6 @@ impl ContainerRow {
 pub struct ImageRow {
     pub id: String,
     pub short_id: SharedString,
-    pub repo: SharedString,
     pub repository_tag: SharedString,
     pub size: i64,
     pub size_label: SharedString,
@@ -100,16 +97,10 @@ impl ImageRow {
             .first()
             .cloned()
             .unwrap_or_else(|| "<none>".to_string());
-        let repo = repository_tag
-            .split(':')
-            .next()
-            .unwrap_or("<none>")
-            .to_string();
         let created = DateTime::from_timestamp(image.created, 0).unwrap_or(now);
         Self {
             short_id: image.id.chars().take(12).collect::<String>().into(),
             id: image.id,
-            repo: truncate(&repo, 44).into(),
             repository_tag: truncate(&repository_tag, 48).into(),
             size: image.size,
             size_label: format_bytes(image.size).into(),
@@ -222,7 +213,7 @@ pub fn format_ports(ports: &[PortSummary]) -> String {
     parts.join(", ")
 }
 
-fn truncate_chars(s: &str, max_chars: usize) -> String {
+pub fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
     }
@@ -230,10 +221,6 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(keep).collect();
     out.push('…');
     out
-}
-
-pub fn truncate(s: &str, max_chars: usize) -> String {
-    truncate_chars(s, max_chars)
 }
 
 pub fn strip_ansi(input: &str) -> String {
@@ -293,10 +280,12 @@ pub fn parse_logs(chunks: &[LogOutput]) -> Vec<LogLine> {
 /// Docker prefixes each line with an RFC3339 stamp when `timestamps(true)` is
 /// requested; peel it off so the renderer can dim it separately.
 fn split_timestamp(line: &str) -> (Option<String>, &str) {
-    if let Some((first, rest)) = line.split_once(' ') {
-        if first.len() >= 20 && first.contains('T') && first.ends_with('Z') {
-            return (Some(first.to_string()), rest);
-        }
+    if let Some((first, rest)) = line.split_once(' ')
+        && first.len() >= 20
+        && first.contains('T')
+        && first.ends_with('Z')
+    {
+        return (Some(first.to_string()), rest);
     }
     (None, line)
 }
@@ -410,7 +399,6 @@ mod tests {
         assert_eq!(row.image.as_ref(), "nginx:1");
         assert_eq!(row.status.as_ref(), "Up 2 minutes");
         assert_eq!(row.created_label.as_ref(), "2m ago");
-        assert_eq!(row.short_id, "abc123def456");
     }
 
     #[test]

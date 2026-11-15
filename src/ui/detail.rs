@@ -1,6 +1,5 @@
 use crate::docker::model::{LogLine, ResourceKind};
 use crate::theme::Theme;
-use gpui::UniformListScrollHandle;
 use gpui::prelude::*;
 use gpui::{IntoElement, ScrollHandle, SharedString, div, px};
 
@@ -21,7 +20,6 @@ pub struct DetailState {
     pub logs_requested: bool,
     pub missing: bool,
     pub error: Option<String>,
-    pub scroll: UniformListScrollHandle,
     /// Keeps the inspect viewport where the user left it across live refreshes.
     pub inspect_scroll: ScrollHandle,
 }
@@ -49,7 +47,6 @@ impl DetailState {
             logs_requested: false,
             missing: false,
             error: None,
-            scroll: UniformListScrollHandle::new(),
             inspect_scroll: ScrollHandle::default(),
         }
     }
@@ -64,11 +61,10 @@ pub fn render_logs(lines: &[LogLine], theme: &Theme) -> impl IntoElement {
         .min_h(px(0.))
         .overflow_y_scroll()
         .overflow_x_scroll()
-        .p(px(16.))
+        .p_3()
         .flex()
         .flex_col()
-        .text_size(px(12.))
-        .line_height(px(20.))
+        .text_xs()
         .font_family("JetBrains Mono");
 
     if lines.is_empty() {
@@ -85,14 +81,9 @@ pub fn render_logs(lines: &[LogLine], theme: &Theme) -> impl IntoElement {
         } else {
             theme.text
         };
-        let mut row = div().flex().gap(px(8.)).whitespace_nowrap();
+        let mut row = div().flex().gap_2().whitespace_nowrap();
         if let Some(timestamp) = &line.timestamp {
-            row = row.child(
-                div()
-                    .text_size(px(10.))
-                    .text_color(theme.text_faint)
-                    .child(timestamp.clone()),
-            );
+            row = row.child(div().text_color(theme.text_dim).child(timestamp.clone()));
         }
         container = container.child(row.child(div().text_color(color).child(line.text.clone())));
     }

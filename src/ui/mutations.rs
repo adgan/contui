@@ -34,14 +34,6 @@ pub struct RunState {
 }
 
 impl RunState {
-    pub fn retry_spec(&self) -> Option<RunSpec> {
-        if self.pull_then_retry {
-            self.submitted.clone()
-        } else {
-            None
-        }
-    }
-
     /// Starts the retry attempt: freezes the form as submitting, clears the
     /// stale error, and returns the exact spec to send.
     pub fn begin_retry(&mut self, epoch: u64) -> Option<RunSpec> {
@@ -75,10 +67,10 @@ pub struct PullState {
 
 impl PullState {
     pub fn record(&mut self, layer: Option<String>, detail: Option<(u64, u64)>) {
-        if let (Some(layer), Some((current, total))) = (layer, detail) {
-            if total > 0 {
-                self.layers.insert(layer, (current, total));
-            }
+        if let (Some(layer), Some((current, total))) = (layer, detail)
+            && total > 0
+        {
+            self.layers.insert(layer, (current, total));
         }
     }
 
@@ -183,11 +175,6 @@ impl Mutations {
             run.pull_then_retry = false;
         }
     }
-
-    pub fn is_pending(&self, target: &Target) -> bool {
-        self.pending.contains_key(&key(target))
-    }
-
 
     /// Returns false when this target already has an action in flight, so a
     /// double click never queues the same mutation twice.
@@ -676,9 +663,8 @@ mod tests {
             pull_then_retry: true,
             ..Default::default()
         };
-        assert_eq!(run.retry_spec(), Some(submitted));
-        run.pull_then_retry = false;
-        assert_eq!(run.retry_spec(), None);
+        assert_eq!(run.begin_retry(9), Some(submitted));
+        assert_eq!(run.begin_retry(9), None, "the retry starts only once");
     }
 
     #[test]

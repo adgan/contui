@@ -54,6 +54,16 @@ pub fn edit_text(text: &mut String, event: &KeyDownEvent, cx: &mut App) -> bool 
     apply_edit(text, &event.keystroke.key, platform, control, pasted)
 }
 
+/// Styling flags for one field, grouped so callers never pass a run of bare
+/// booleans whose order is easy to get wrong.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FieldStyle {
+    pub focused: bool,
+    pub error: bool,
+    pub read_only: bool,
+    pub mono: bool,
+}
+
 /// Visuals for one input row. The caller owns the key handler, because only it
 /// knows which field of the form this input edits.
 pub fn field(
@@ -61,12 +71,15 @@ pub fn field(
     text: &str,
     placeholder: &str,
     focus: &FocusHandle,
-    focused: bool,
-    error: bool,
-    read_only: bool,
-    mono: bool,
+    style: FieldStyle,
     theme: &Theme,
 ) -> Stateful<gpui::Div> {
+    let FieldStyle {
+        focused,
+        error,
+        read_only,
+        mono,
+    } = style;
     let border = if error {
         theme.error
     } else if focused {

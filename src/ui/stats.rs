@@ -129,7 +129,6 @@ mod tests {
     fn container(name: &str, state: ContainerState) -> ContainerRow {
         ContainerRow {
             id: format!("{name}-id"),
-            short_id: "abcdef123456".into(),
             name: SharedString::from(name.to_string()),
             state,
             status: "Up".into(),
@@ -145,7 +144,6 @@ mod tests {
         ImageRow {
             id: format!("{tag}-id"),
             short_id: "abcdef123456".into(),
-            repo: SharedString::from(tag.to_string()),
             repository_tag: SharedString::from(tag.to_string()),
             size,
             size_label: format_bytes(size).into(),
