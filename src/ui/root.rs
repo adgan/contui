@@ -997,7 +997,7 @@ impl RootView {
     }
 }
 
-/// One visible line in the grouped containers list. Group headers are 44px
+/// One visible line in the grouped containers list. Group headers are 52px
 /// like data rows, so `uniform_list` keeps working.
 #[derive(Clone, Debug, PartialEq)]
 enum ContainerSlot {

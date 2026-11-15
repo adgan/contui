@@ -2216,7 +2216,7 @@ fn action_enabled(state: Option<ContainerState>, kind: ResourceKind, action: Act
 }
 
 /// Height of the blank band that separates one grouped section from the next.
-/// It is part of the 44px header so `uniform_list` keeps a single row height.
+/// It is part of the 52px header so `uniform_list` keeps a single row height.
 const SECTION_GAP: f32 = 12.0;
 
 fn group_header(

@@ -28,7 +28,7 @@ impl Layout {
             page_padding: if compact { space::LG } else { space::XXL },
             section_gap: if compact { space::MD } else { space::XL },
             table_header_height: 40.0,
-            row_height: 44.0,
+            row_height: 52.0,
             cell_padding: 20.0,
         }
     }
@@ -70,12 +70,12 @@ mod tests {
         let full = Layout::for_viewport(size(px(1280.), px(820.)));
         assert_eq!(full.top_bar_height, 64.0);
         assert_eq!(full.overview_height, 88.0);
-        assert_eq!(full.row_height, 44.0);
+        assert_eq!(full.row_height, 52.0);
         assert_eq!(full.table_header_height, 40.0);
 
         let compact = Layout::for_viewport(size(px(960.), px(600.)));
         assert_eq!(compact.top_bar_height, 56.0);
         assert_eq!(compact.overview_height, 76.0);
-        assert_eq!(compact.row_height, 44.0);
+        assert_eq!(compact.row_height, 52.0);
     }
 }
