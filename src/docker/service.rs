@@ -7,24 +7,26 @@ use crate::docker::endpoint::{
 };
 use crate::docker::events::Debouncer;
 use crate::docker::model::{
-    parse_logs, status_from_error, ContainerRow, ImageRow, LogLine, ResourceKind, Snapshot,
-    VolumeRow,
+    parse_logs, status_from_error, ContainerRow, ContainerState, ContainerUsage, ImageRow,
+    LogLine, ResourceKind, Snapshot, VolumeRow,
 };
 use async_channel::{Receiver, Sender};
 use bollard::Docker;
+use bollard::models::ContainerStatsResponse;
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, CreateImageOptionsBuilder,
     ListContainersOptionsBuilder, ListImagesOptionsBuilder, ListVolumesOptionsBuilder,
     LogsOptionsBuilder, RemoveContainerOptions, RemoveContainerOptionsBuilder,
-    RemoveImageOptionsBuilder, RemoveVolumeOptionsBuilder, StopContainerOptions,
-    StopContainerOptionsBuilder,
+    RemoveImageOptionsBuilder, RemoveVolumeOptionsBuilder, StatsOptionsBuilder,
+    StopContainerOptions, StopContainerOptionsBuilder,
 };
 use chrono::Utc;
 use futures_util::{join, StreamExt};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
 
 /// Bollard's connection timeout is a per-read/write socket timeout, not a
 /// connect timeout. It must outlast Docker's 10s stop grace and the 60s pull
@@ -91,6 +93,13 @@ pub enum Response {
     Logs {
         id: String,
         lines: Vec<LogLine>,
+    },
+    Usage {
+        id: String,
+        usage: ContainerUsage,
+    },
+    UsageStale {
+        id: String,
     },
     Dirty {
         ids: Vec<(ResourceKind, String)>,
@@ -272,6 +281,115 @@ async fn send_run_failed(
         .await;
 }
 
+fn running_container_ids(snapshot: &Snapshot) -> HashSet<String> {
+    snapshot
+        .containers
+        .iter()
+        .filter(|container| container.state == ContainerState::Running)
+        .map(|container| container.id.clone())
+        .collect()
+}
+
+/// The difference between the containers that should have a stream and the
+/// tasks that currently have one. Both lists are sorted so the reconciliation
+/// is deterministic.
+fn stats_plan(
+    running: &HashSet<String>,
+    active: &HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut start: Vec<String> = running.difference(active).cloned().collect();
+    let mut stop: Vec<String> = active.difference(running).cloned().collect();
+    start.sort();
+    stop.sort();
+    (start, stop)
+}
+
+async fn next_sample<S>(
+    stream: &mut S,
+    timeout: Duration,
+) -> Option<Result<ContainerStatsResponse, bollard::errors::Error>>
+where
+    S: futures_util::Stream<Item = Result<ContainerStatsResponse, bollard::errors::Error>> + Unpin,
+{
+    tokio::time::timeout(timeout, stream.next()).await.ok().flatten()
+}
+
+/// One long-lived stream per running container. The actor aborts this task when
+/// the container stops; errors and stalls retry with backoff and tell the UI to
+/// drop the last sample so a frozen number never looks live.
+async fn stats_loop(docker: Docker, id: String, resp_tx: Sender<Response>) {
+    let mut backoff_secs = 1u64;
+
+    loop {
+        let mut stream = Box::pin(docker.stats(
+            &id,
+            Some(StatsOptionsBuilder::new().stream(true).build()),
+        ));
+
+        loop {
+            match next_sample(&mut stream, Duration::from_secs(5)).await {
+                Some(Ok(sample)) => {
+                    if let Some(usage) = ContainerUsage::from_sample(&sample) {
+                        if resp_tx
+                            .send(Response::Usage {
+                                id: id.clone(),
+                                usage,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        backoff_secs = 1;
+                    }
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+
+        if resp_tx
+            .send(Response::UsageStale { id: id.clone() })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(10);
+    }
+}
+
+fn reconcile_stats(
+    docker: &Docker,
+    resp_tx: &Sender<Response>,
+    tasks: &mut HashMap<String, JoinHandle<()>>,
+    running: &HashSet<String>,
+) {
+    tasks.retain(|_, handle| {
+        if handle.is_finished() {
+            handle.abort();
+            false
+        } else {
+            true
+        }
+    });
+
+    let active: HashSet<String> = tasks.keys().cloned().collect();
+    let (start, stop) = stats_plan(running, &active);
+
+    for id in stop {
+        if let Some(handle) = tasks.remove(&id) {
+            handle.abort();
+        }
+    }
+    for id in start {
+        tasks.insert(
+            id.clone(),
+            tokio::spawn(stats_loop(docker.clone(), id, resp_tx.clone())),
+        );
+    }
+}
+
 async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Response>) {
     let status = match tokio::time::timeout(Duration::from_secs(3), docker.ping()).await {
         Ok(Ok(_)) => HostStatus::Connected,
@@ -280,11 +398,15 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
     };
     let _ = resp_tx.send(Response::Status(status)).await;
 
+    let mut stats_tasks: HashMap<String, JoinHandle<()>> = HashMap::new();
+
     while let Ok(req) = cmd_rx.recv().await {
         match req {
             Request::FetchAll => match fetch_all(&docker).await {
                 Ok(snapshot) => {
+                    let running = running_container_ids(&snapshot);
                     let _ = resp_tx.send(Response::Snapshot(snapshot)).await;
+                    reconcile_stats(&docker, &resp_tx, &mut stats_tasks, &running);
                 }
                 Err(err) => {
                     let _ = resp_tx.send(Response::Status(status_from_error(&err))).await;
@@ -722,5 +844,56 @@ mod tests {
             }
             other => panic!("expected AuthFailed, got {other:?}"),
         }
+    }
+
+    fn container(id: &str, state: ContainerState) -> ContainerRow {
+        ContainerRow {
+            id: id.to_string(),
+            name: gpui::SharedString::from(id.to_string()),
+            state,
+            status: gpui::SharedString::from("Up"),
+            image: gpui::SharedString::from("alpine:3.20"),
+            ports: gpui::SharedString::from("—"),
+            created: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            created_label: gpui::SharedString::from("2m ago"),
+            compose_project: None,
+        }
+    }
+
+    #[test]
+    fn running_ids_exclude_paused_and_restarting() {
+        let snapshot = Snapshot {
+            containers: vec![
+                container("a", ContainerState::Running),
+                container("b", ContainerState::Paused),
+                container("c", ContainerState::Restarting),
+                container("d", ContainerState::Exited),
+            ],
+            ..Snapshot::empty()
+        };
+        assert_eq!(
+            running_container_ids(&snapshot),
+            HashSet::from(["a".to_string()])
+        );
+    }
+
+    #[test]
+    fn stats_plan_starts_new_ids_and_stops_gone_ids() {
+        let running = HashSet::from(["a".to_string(), "b".to_string()]);
+        let active = HashSet::from(["b".to_string(), "c".to_string()]);
+        assert_eq!(
+            stats_plan(&running, &active),
+            (vec!["a".to_string()], vec!["c".to_string()])
+        );
+    }
+
+    #[test]
+    fn next_sample_returns_none_when_the_stream_stalls() {
+        use bollard::models::ContainerStatsResponse;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut stream =
+            futures_util::stream::pending::<Result<ContainerStatsResponse, bollard::errors::Error>>();
+        let sample = runtime.block_on(next_sample(&mut stream, Duration::from_millis(1)));
+        assert!(sample.is_none());
     }
 }

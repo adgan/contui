@@ -302,6 +302,7 @@ impl RootView {
                     }
                 }
             }
+            Response::Usage { .. } | Response::UsageStale { .. } => {}
             Response::Dirty { .. } => {
                 // Keep the open inspect tree on screen while the refetch runs.
                 // Clearing it unmounts the scroll area and jumps the user back
