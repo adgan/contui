@@ -420,6 +420,8 @@ impl RootView {
                         .apply_run_failed(message, missing_image, created, epoch);
                 self.apply_run_outcome(outcome);
             }
+            // Wired up in the next task; keeps this commit compiling.
+            Response::Stats { .. } => {}
         }
     }
 
