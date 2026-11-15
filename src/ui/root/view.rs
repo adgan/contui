@@ -11,6 +11,7 @@ use crate::ui::style::Layout;
 use crate::ui::table::{CellStyle, ColumnWidth, cell_wraps};
 use crate::ui::widgets::button::{ButtonSpec, button};
 use crate::ui::widgets::pill::{state_pill, state_pill_inline};
+use crate::ui::widgets::tooltip::CellTooltip;
 use crate::ui::widgets::stat_card::{StatCard, stat_card};
 use crate::ui::widgets::usage_meter::{memory_color, usage_meter};
 use gpui::{
@@ -2030,6 +2031,14 @@ impl RootView {
                             .id(SharedString::from(format!("cell-{row_id}-{column}")))
                             .map_width(width);
                         if cell_wraps(column, style) {
+                            let full = cell.to_string();
+                            let tip_theme = theme.clone();
+                            text = text.hoverable_tooltip(move |_window, cx| -> gpui::AnyView {
+                                cx.new(|_cx| {
+                                    CellTooltip::new(full.clone().into(), tip_theme.clone())
+                                })
+                                .into()
+                            });
                             text = text.line_clamp(2).text_ellipsis();
                         } else {
                             text = text.truncate();
