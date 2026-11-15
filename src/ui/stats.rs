@@ -1,5 +1,8 @@
-use crate::docker::model::{ContainerState, Snapshot, format_bytes};
+use crate::docker::model::{
+    ContainerState, ContainerUsage, Snapshot, format_bytes, format_cpu_percent, format_usage_bytes,
+};
 use gpui::SharedString;
+use std::collections::HashMap;
 
 /// Numbers for the global overview strip. Computed once per snapshot so the
 /// render path never walks the lists.
@@ -112,6 +115,104 @@ impl OverviewStats {
     /// True when the card should show placeholders instead of numbers.
     pub fn is_loading(&self) -> bool {
         !self.loaded
+    }
+}
+
+/// Host-wide live usage for the fourth overview card. CPU is normalized per
+/// sample, so containers with different core counts cannot inflate the total.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct UsageTotals {
+    pub cpu_percent: Option<f32>,
+    pub memory_bytes: Option<u64>,
+    pub cpu_reporting: usize,
+    pub memory_reporting: usize,
+    pub running: usize,
+}
+
+impl UsageTotals {
+    pub fn from_snapshot(snapshot: &Snapshot, usage: &HashMap<String, ContainerUsage>) -> Self {
+        let mut totals = Self::default();
+
+        for container in &snapshot.containers {
+            if container.state != ContainerState::Running {
+                continue;
+            }
+            totals.running += 1;
+            let Some(sample) = usage.get(&container.id) else {
+                continue;
+            };
+            if let Some(cpu) = sample.cpu_percent {
+                totals.cpu_percent = Some(
+                    totals.cpu_percent.unwrap_or(0.0)
+                        + cpu / sample.online_cpus.max(1) as f32,
+                );
+                totals.cpu_reporting += 1;
+            }
+            if let Some(memory) = sample.memory_usage {
+                totals.memory_bytes = Some(totals.memory_bytes.unwrap_or(0) + memory);
+                totals.memory_reporting += 1;
+            }
+        }
+
+        totals
+    }
+}
+
+/// The text of the overview usage card, with every placeholder decided here so
+/// the render path stays declarative.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UsageCardLabels {
+    pub value: String,
+    pub right: String,
+    pub foot: String,
+}
+
+impl UsageCardLabels {
+    pub fn from(totals: &UsageTotals, loaded: bool, connected: bool) -> Self {
+        if !loaded {
+            return Self {
+                value: "—".into(),
+                right: "—".into(),
+                foot: "connecting…".into(),
+            };
+        }
+        if !connected {
+            return Self {
+                value: "—".into(),
+                right: "—".into(),
+                foot: "host disconnected".into(),
+            };
+        }
+        if totals.running == 0 {
+            return Self {
+                value: "0.00%".into(),
+                right: "0 running".into(),
+                foot: "no running containers".into(),
+            };
+        }
+
+        let value = totals
+            .cpu_percent
+            .map(format_cpu_percent)
+            .unwrap_or_else(|| "—".into());
+        let right = if totals.cpu_reporting < totals.running {
+            format!("{} of {}", totals.cpu_reporting, totals.running)
+        } else {
+            format!("{} running", totals.running)
+        };
+        let foot = match totals.memory_bytes {
+            Some(memory) => {
+                let base = format!("{} memory", format_usage_bytes(memory));
+                if totals.memory_reporting < totals.running {
+                    format!("{base} · {}/{}", totals.memory_reporting, totals.running)
+                } else {
+                    base
+                }
+            }
+            None => "waiting for stats…".into(),
+        };
+
+        Self { value, right, foot }
     }
 }
 
@@ -262,5 +363,120 @@ mod tests {
         stats.containers_total = 1;
         stats.containers_running = 3;
         assert_eq!(stats.containers_share(), 1.0);
+    }
+
+    #[test]
+    fn totals_ignore_stopped_containers_and_normalize_each_sample() {
+        let snapshot = Snapshot {
+            containers: vec![
+                container("a", ContainerState::Running),
+                container("b", ContainerState::Running),
+                container("c", ContainerState::Exited),
+            ],
+            fetched_at: Some(now()),
+            ..Snapshot::empty()
+        };
+        let usage = HashMap::from([
+            (
+                "a-id".to_string(),
+                ContainerUsage {
+                    cpu_percent: Some(100.0),
+                    memory_usage: Some(1_000),
+                    memory_limit: None,
+                    online_cpus: 2,
+                },
+            ),
+            (
+                "b-id".to_string(),
+                ContainerUsage {
+                    cpu_percent: Some(200.0),
+                    memory_usage: Some(2_000),
+                    memory_limit: None,
+                    online_cpus: 4,
+                },
+            ),
+            (
+                "c-id".to_string(),
+                ContainerUsage {
+                    cpu_percent: Some(999.0),
+                    memory_usage: Some(9_999),
+                    memory_limit: None,
+                    online_cpus: 1,
+                },
+            ),
+        ]);
+        let totals = UsageTotals::from_snapshot(&snapshot, &usage);
+        assert_eq!(totals.running, 2);
+        assert_eq!(totals.cpu_reporting, 2);
+        assert_eq!(totals.memory_reporting, 2);
+        assert!((totals.cpu_percent.unwrap() - 100.0).abs() < 0.01);
+        assert_eq!(totals.memory_bytes, Some(3_000));
+    }
+
+    #[test]
+    fn card_labels_show_partial_cpu_and_memory_coverage() {
+        let totals = UsageTotals {
+            cpu_percent: Some(4.1),
+            memory_bytes: Some(1_288_490_188),
+            cpu_reporting: 2,
+            memory_reporting: 3,
+            running: 3,
+        };
+        let labels = UsageCardLabels::from(&totals, true, true);
+        assert_eq!(labels.value, "4.10%");
+        assert_eq!(labels.right, "2 of 3");
+        assert_eq!(labels.foot, "1.2 GB memory");
+    }
+
+    #[test]
+    fn card_labels_use_running_count_when_coverage_is_complete() {
+        let totals = UsageTotals {
+            cpu_percent: Some(4.1),
+            memory_bytes: Some(1_288_490_188),
+            cpu_reporting: 3,
+            memory_reporting: 2,
+            running: 3,
+        };
+        let labels = UsageCardLabels::from(&totals, true, true);
+        assert_eq!(labels.right, "3 running");
+        assert_eq!(labels.foot, "1.2 GB memory · 2/3");
+    }
+
+    #[test]
+    fn card_labels_cover_loading_disconnected_empty_and_missing_samples() {
+        let empty = UsageTotals::default();
+        assert_eq!(
+            UsageCardLabels::from(&empty, false, false),
+            UsageCardLabels {
+                value: "—".into(),
+                right: "—".into(),
+                foot: "connecting…".into()
+            }
+        );
+        assert_eq!(
+            UsageCardLabels::from(&empty, true, false),
+            UsageCardLabels {
+                value: "—".into(),
+                right: "—".into(),
+                foot: "host disconnected".into()
+            }
+        );
+        assert_eq!(
+            UsageCardLabels::from(&empty, true, true),
+            UsageCardLabels {
+                value: "0.00%".into(),
+                right: "0 running".into(),
+                foot: "no running containers".into()
+            }
+        );
+
+        let running_no_samples = UsageTotals {
+            running: 2,
+            ..UsageTotals::default()
+        };
+        let labels = UsageCardLabels::from(&running_no_samples, true, true);
+        assert_eq!(labels.value, "—");
+        assert_eq!(labels.right, "0 of 2");
+        assert_eq!(labels.foot, "waiting for stats…");
     }
 }
