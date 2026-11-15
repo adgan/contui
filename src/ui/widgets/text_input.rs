@@ -1,6 +1,6 @@
 use crate::theme::Theme;
 use gpui::prelude::*;
-use gpui::{div, px, App, FocusHandle, KeyDownEvent, Stateful};
+use gpui::{App, FocusHandle, KeyDownEvent, Stateful, div, px};
 
 /// The pure editing rule behind every single-line field. The caret is always at
 /// the end; paste is the only multi-character insert and stays on one line.
@@ -84,16 +84,16 @@ pub fn field(
 
     let mut element = div()
         .id(id)
-        .h(px(28.))
-        .px_2()
+        .h(px(34.))
+        .px(px(10.))
         .flex()
         .items_center()
-        .gap_1()
-        .rounded_md()
+        .gap(px(4.))
+        .rounded(px(10.))
         .bg(theme.bg)
         .border_1()
         .border_color(border)
-        .text_sm()
+        .text_size(px(13.))
         .text_color(color)
         .track_focus(focus)
         .cursor_text()
@@ -101,7 +101,7 @@ pub fn field(
         .child(div().truncate().child(shown.to_string()));
 
     if mono {
-        element = element.font_family("JetBrains Mono");
+        element = element.font_family("JetBrains Mono").text_size(px(12.));
     }
     if focused && !read_only {
         element = element.child(div().w(px(1.)).h(px(14.)).bg(theme.accent));

@@ -4,5 +4,7 @@ pub mod empty;
 pub mod inspect;
 pub mod mutations;
 pub mod root;
+pub mod stats;
+pub mod style;
 pub mod table;
 pub mod widgets;

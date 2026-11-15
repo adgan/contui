@@ -1,6 +1,6 @@
 use crate::docker::model::ResourceKind;
 use chrono::{DateTime, Utc};
-use gpui::{Rgba, SharedString, UniformListScrollHandle};
+use gpui::{SharedString, UniformListScrollHandle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionsColumn {
@@ -12,9 +12,9 @@ pub enum ActionsColumn {
 impl ActionsColumn {
     pub fn width(self) -> f32 {
         match self {
-            ActionsColumn::Container => 124.0,
-            ActionsColumn::Image => 84.0,
-            ActionsColumn::Volume => 44.0,
+            ActionsColumn::Container => 132.0,
+            ActionsColumn::Image => 92.0,
+            ActionsColumn::Volume => 52.0,
         }
     }
 
@@ -33,12 +33,29 @@ pub enum ColumnWidth {
     Flex(f32),
 }
 
+/// How one data column renders. Pills are used for live container state; the
+/// cell text still drives filtering and sorting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellStyle {
+    Text,
+    Mono,
+    Timestamp,
+    Pill,
+}
+
 #[derive(Clone, Debug)]
 pub struct TableSpec {
     pub id: &'static str,
     pub columns: Vec<&'static str>,
     pub widths: Vec<ColumnWidth>,
+    pub styles: Vec<CellStyle>,
     pub actions: Option<ActionsColumn>,
+}
+
+impl TableSpec {
+    pub fn style_count_matches_columns(&self) -> bool {
+        self.styles.len() == self.columns.len()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -53,7 +70,6 @@ pub struct TableRow {
     pub id: String,
     pub cells: Vec<SharedString>,
     pub sort_values: Vec<SortValue>,
-    pub accent: Option<Rgba>,
 }
 
 impl TableRow {
@@ -121,8 +137,7 @@ impl TableState {
         self.sort = previous.sort;
         let selected_id = previous.selected_row().map(|row| row.id.clone());
         self.recompute();
-        self.selected = selected_id
-            .and_then(|id| self.rows.iter().position(|row| row.id == id));
+        self.selected = selected_id.and_then(|id| self.rows.iter().position(|row| row.id == id));
     }
 
     pub fn click_header(&mut self, column: usize) {
@@ -166,8 +181,8 @@ impl TableState {
             .iter()
             .position(|&ix| ix == selected)
             .unwrap_or(0);
-        let next = (current_position as isize + delta)
-            .clamp(0, self.cached.len() as isize - 1) as usize;
+        let next =
+            (current_position as isize + delta).clamp(0, self.cached.len() as isize - 1) as usize;
         self.selected = Some(self.cached[next]);
     }
 
@@ -211,6 +226,7 @@ mod tests {
             id: "t",
             columns: vec!["Name", "Image"],
             widths: vec![ColumnWidth::Flex(1.0), ColumnWidth::Flex(1.0)],
+            styles: vec![CellStyle::Text, CellStyle::Mono],
             actions: None,
         }
     }
@@ -231,7 +247,6 @@ mod tests {
                 SortValue::Text(name.to_string()),
                 SortValue::Text(image.to_string()),
             ],
-            accent: None,
         }
     }
 
@@ -271,13 +286,11 @@ mod tests {
                 id: "big".into(),
                 cells: vec!["456 MB".into(), "".into()],
                 sort_values: vec![SortValue::Number(456_654_848), SortValue::Number(0)],
-                accent: None,
             },
             TableRow {
                 id: "small".into(),
                 cells: vec!["93.8 MB".into(), "".into()],
                 sort_values: vec![SortValue::Number(98_353_152), SortValue::Number(0)],
-                accent: None,
             },
         ]);
         t.click_header(0);
@@ -293,13 +306,11 @@ mod tests {
                 id: "new".into(),
                 cells: vec!["".into(), "".into()],
                 sort_values: vec![SortValue::Time(newer), SortValue::Number(0)],
-                accent: None,
             },
             TableRow {
                 id: "old".into(),
                 cells: vec!["".into(), "".into()],
                 sort_values: vec![SortValue::Time(older), SortValue::Number(0)],
-                accent: None,
             },
         ]);
         u.click_header(0);
@@ -400,8 +411,18 @@ mod tests {
             id: "t",
             columns: vec!["A", "B"],
             widths: vec![ColumnWidth::Fixed(80.0), ColumnWidth::Flex(1.0)],
+            styles: vec![CellStyle::Text, CellStyle::Timestamp],
             actions: None,
         };
         assert_eq!(s.columns.len(), s.widths.len());
+        assert!(s.style_count_matches_columns());
+    }
+
+    #[test]
+    fn every_column_has_a_cell_style() {
+        let mut s = spec();
+        assert!(s.style_count_matches_columns());
+        s.styles.pop();
+        assert!(!s.style_count_matches_columns());
     }
 }

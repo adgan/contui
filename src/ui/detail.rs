@@ -1,8 +1,8 @@
 use crate::docker::model::{LogLine, ResourceKind};
 use crate::theme::Theme;
+use gpui::UniformListScrollHandle;
 use gpui::prelude::*;
 use gpui::{IntoElement, SharedString, div, px};
-use gpui::UniformListScrollHandle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DetailTab {
@@ -61,10 +61,11 @@ pub fn render_logs(lines: &[LogLine], theme: &Theme) -> impl IntoElement {
         .min_h(px(0.))
         .overflow_y_scroll()
         .overflow_x_scroll()
-        .p_3()
+        .p(px(16.))
         .flex()
         .flex_col()
-        .text_xs()
+        .text_size(px(12.))
+        .line_height(px(20.))
         .font_family("JetBrains Mono");
 
     if lines.is_empty() {
@@ -76,10 +77,19 @@ pub fn render_logs(lines: &[LogLine], theme: &Theme) -> impl IntoElement {
     }
 
     for line in lines {
-        let color = if line.stderr { theme.paused } else { theme.text };
-        let mut row = div().flex().gap_2().whitespace_nowrap();
+        let color = if line.stderr {
+            theme.paused
+        } else {
+            theme.text
+        };
+        let mut row = div().flex().gap(px(8.)).whitespace_nowrap();
         if let Some(timestamp) = &line.timestamp {
-            row = row.child(div().text_color(theme.text_dim).child(timestamp.clone()));
+            row = row.child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(theme.text_faint)
+                    .child(timestamp.clone()),
+            );
         }
         container = container.child(row.child(div().text_color(color).child(line.text.clone())));
     }

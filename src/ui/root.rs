@@ -1,26 +1,33 @@
 use crate::docker::actions::{
-    build_run_spec, container_actions, ActionKind, ContainerAction, Proto, RunField, RunForm, Target,
+    ActionKind, ContainerAction, Proto, RunField, RunForm, Target, build_run_spec,
+    container_actions,
 };
-use crate::docker::endpoint::{discover, HostInfo, HostStatus};
-use crate::docker::model::{format_bytes, ContainerState, Snapshot};
+use crate::docker::endpoint::{HostInfo, HostStatus, discover};
+use crate::docker::model::ResourceKind;
+use crate::docker::model::{ContainerState, Snapshot, format_bytes};
 use crate::docker::service::{DockerService, PullOrigin, Request, Response};
 use crate::theme::Theme;
-use crate::docker::model::ResourceKind;
-use crate::ui::detail::{render_logs, DetailState, DetailTab};
-use crate::ui::inspect::{build_tree, InspectNode};
+use crate::ui::detail::{DetailState, DetailTab, render_logs};
+use crate::ui::inspect::{InspectNode, build_tree};
 use crate::ui::mutations::{Mutations, PullState, RowMenuState, RunOutcome, RunState, Toast};
-use crate::ui::table::{ActionsColumn, ColumnWidth, SortValue, TableRow, TableSpec, TableState};
+use crate::ui::stats::OverviewStats;
+use crate::ui::style::Layout;
+use crate::ui::table::{
+    ActionsColumn, CellStyle, ColumnWidth, SortValue, TableRow, TableSpec, TableState,
+};
+use crate::ui::widgets::button::{ButtonSpec, button};
+use crate::ui::widgets::pill::{state_label, state_pill, state_pill_inline};
+use crate::ui::widgets::stat_card::{StatCard, stat_card};
 use chrono::Utc;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Div, FocusHandle, KeyDownEvent, MouseButton, Render, SharedString,
-    Subscription, Task, Window, div, px, svg, uniform_list,
+    AnyElement, Context, Div, FocusHandle, FontWeight, KeyDownEvent, MouseButton, Render,
+    SharedString, Subscription, Task, Window, div, px, svg, uniform_list,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 const STALE_AFTER_SECS: i64 = 5;
-const ROW_HEIGHT: f32 = 32.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
@@ -122,6 +129,7 @@ pub struct RootView {
     pub theme: Theme,
     pub service: Option<DockerService>,
     pub snapshot: Snapshot,
+    pub stats: OverviewStats,
     pub status: HostStatus,
     pub hosts: Vec<HostInfo>,
     pub active_host: Option<String>,
@@ -150,6 +158,7 @@ impl RootView {
             theme: Theme::dark(),
             service: None,
             snapshot: Snapshot::empty(),
+            stats: OverviewStats::default(),
             status: HostStatus::Unknown,
             hosts: discovery.hosts,
             active_host: discovery.active,
@@ -185,11 +194,18 @@ impl RootView {
             id: "containers-table",
             columns: vec!["Name", "State", "Image", "Ports", "Created"],
             widths: vec![
+                ColumnWidth::Flex(2.2),
+                ColumnWidth::Fixed(104.0),
                 ColumnWidth::Flex(2.0),
-                ColumnWidth::Fixed(96.0),
-                ColumnWidth::Flex(2.0),
-                ColumnWidth::Fixed(120.0),
-                ColumnWidth::Fixed(96.0),
+                ColumnWidth::Fixed(132.0),
+                ColumnWidth::Fixed(100.0),
+            ],
+            styles: vec![
+                CellStyle::Text,
+                CellStyle::Pill,
+                CellStyle::Mono,
+                CellStyle::Mono,
+                CellStyle::Timestamp,
             ],
             actions: Some(ActionsColumn::Container),
         };
@@ -222,7 +238,6 @@ impl RootView {
                     SortValue::Text(c.ports.to_string()),
                     SortValue::Time(c.created),
                 ],
-                accent: Some(state_color(c.state)),
             })
             .collect();
 
@@ -237,10 +252,17 @@ impl RootView {
             columns: vec!["Repository", "ID", "Size", "Created", "In Use"],
             widths: vec![
                 ColumnWidth::Flex(3.0),
-                ColumnWidth::Fixed(110.0),
-                ColumnWidth::Fixed(86.0),
-                ColumnWidth::Fixed(96.0),
-                ColumnWidth::Fixed(72.0),
+                ColumnWidth::Fixed(120.0),
+                ColumnWidth::Fixed(90.0),
+                ColumnWidth::Fixed(100.0),
+                ColumnWidth::Fixed(80.0),
+            ],
+            styles: vec![
+                CellStyle::Text,
+                CellStyle::Mono,
+                CellStyle::Mono,
+                CellStyle::Timestamp,
+                CellStyle::Text,
             ],
             actions: Some(ActionsColumn::Image),
         };
@@ -266,7 +288,6 @@ impl RootView {
                     SortValue::Time(image.created),
                     SortValue::Text(if image.in_use { "yes" } else { "no" }.to_string()),
                 ],
-                accent: None,
             })
             .collect();
 
@@ -281,9 +302,15 @@ impl RootView {
             columns: vec!["Name", "Driver", "Mountpoint", "Created"],
             widths: vec![
                 ColumnWidth::Flex(2.0),
-                ColumnWidth::Fixed(86.0),
+                ColumnWidth::Fixed(100.0),
                 ColumnWidth::Flex(3.0),
-                ColumnWidth::Fixed(96.0),
+                ColumnWidth::Fixed(100.0),
+            ],
+            styles: vec![
+                CellStyle::Text,
+                CellStyle::Text,
+                CellStyle::Mono,
+                CellStyle::Timestamp,
             ],
             actions: Some(ActionsColumn::Volume),
         };
@@ -307,7 +334,6 @@ impl RootView {
                     SortValue::Text(volume.mountpoint.to_string()),
                     SortValue::Text(volume.created_label.to_string()),
                 ],
-                accent: None,
             })
             .collect();
 
@@ -362,6 +388,7 @@ impl RootView {
     fn apply(&mut self, response: Response) {
         match response {
             Response::Snapshot(snapshot) => {
+                self.stats = OverviewStats::from_snapshot(&snapshot);
                 self.snapshot = snapshot;
                 self.rebuild_tables();
                 self.last_error = None;
@@ -479,11 +506,14 @@ impl RootView {
                 epoch,
                 error,
             } => {
-                let outcome = self
-                    .mutations
-                    .apply_action_done(target.clone(), action, epoch, error);
+                let outcome =
+                    self.mutations
+                        .apply_action_done(target.clone(), action, epoch, error);
                 if outcome.close_detail {
-                    let open = self.detail.as_ref().map(|detail| (detail.kind, detail.id.clone()));
+                    let open = self
+                        .detail
+                        .as_ref()
+                        .map(|detail| (detail.kind, detail.id.clone()));
                     if open == Some((target.kind, target.id)) {
                         self.close_detail();
                     }
@@ -503,9 +533,9 @@ impl RootView {
                 status,
                 detail,
             } => {
-                let _ = self.mutations.apply_pull_progress(
-                    origin, &reference, epoch, layer, status, detail,
-                );
+                let _ = self
+                    .mutations
+                    .apply_pull_progress(origin, &reference, epoch, layer, status, detail);
             }
             Response::PullDone {
                 origin,
@@ -577,7 +607,9 @@ impl RootView {
     fn scroll_selection_into_view(&mut self, index: usize) {
         let table = &self.tables[index];
         if let Some(position) = table.selection_position() {
-            table.scroll.scroll_to_item(position, gpui::ScrollStrategy::Center);
+            table
+                .scroll
+                .scroll_to_item(position, gpui::ScrollStrategy::Center);
         }
     }
 
@@ -736,20 +768,11 @@ impl RootView {
         }
     }
 
-    fn counts(&self) -> String {
+    fn subtitle(&self) -> String {
         match self.page {
-            Page::Containers => {
-                let running = self
-                    .snapshot
-                    .containers
-                    .iter()
-                    .filter(|c| c.state == ContainerState::Running)
-                    .count();
-                let total = self.snapshot.containers.len();
-                format!("{total} total · {running} running · {} stopped", total - running)
-            }
-            Page::Images => format!("{} images", self.snapshot.images.len()),
-            Page::Volumes => format!("{} volumes", self.snapshot.volumes.len()),
+            Page::Containers => self.stats.containers_subtitle(),
+            Page::Images => self.stats.images_subtitle(),
+            Page::Volumes => self.stats.volumes_subtitle(),
         }
     }
 
@@ -905,16 +928,10 @@ impl RootView {
         }
         if let Some(service) = &self.service {
             match kind {
-                ResourceKind::Container => service.request(Request::RemoveContainer {
-                    id,
-                    force,
-                    epoch,
-                }),
-                ResourceKind::Image => service.request(Request::RemoveImage {
-                    id,
-                    force,
-                    epoch,
-                }),
+                ResourceKind::Container => {
+                    service.request(Request::RemoveContainer { id, force, epoch })
+                }
+                ResourceKind::Image => service.request(Request::RemoveImage { id, force, epoch }),
                 ResourceKind::Volume => service.request(Request::RemoveVolume { name: id, epoch }),
             }
         }
@@ -930,11 +947,7 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = self.theme.clone();
-        let pending = self
-            .mutations
-            .pending
-            .get(&(kind, id.to_string()))
-            .copied();
+        let pending = self.mutations.pending.get(&(kind, id.to_string())).copied();
         let actions: Vec<ActionKind> = if kind == ResourceKind::Container {
             vec![
                 ActionKind::Start,
@@ -946,7 +959,7 @@ impl RootView {
             vec![ActionKind::Remove]
         };
 
-        let mut cluster = div().flex().items_center().gap_1();
+        let mut cluster = div().flex().items_center().gap(px(2.));
         if kind == ResourceKind::Image {
             let prefill = if title == "<none>" || title.ends_with('…') {
                 id.to_string()
@@ -955,14 +968,19 @@ impl RootView {
             };
             let mut run_button = div()
                 .id(SharedString::from(format!("run-image-{id}")))
-                .size(px(24.))
+                .size(px(28.))
                 .occlude()
-                .rounded_md()
+                .rounded(px(6.))
                 .flex()
                 .items_center()
                 .justify_center()
-                .opacity(if emphasized { 1.0 } else { 0.25 })
-                .child(svg().path("icons/run.svg").size(px(14.)).text_color(theme.text));
+                .opacity(if emphasized { 1.0 } else { 0.35 })
+                .child(
+                    svg()
+                        .path("icons/run.svg")
+                        .size(px(14.))
+                        .text_color(theme.text),
+                );
             if pending.is_none() {
                 run_button = run_button
                     .cursor_pointer()
@@ -984,18 +1002,23 @@ impl RootView {
                     "act-{kind:?}-{id}-{}",
                     action.verb()
                 )))
-                .size(px(24.))
+                .size(px(28.))
                 .occlude()
-                .rounded_md()
+                .rounded(px(6.))
                 .flex()
                 .items_center()
                 .justify_center()
-                .opacity(if emphasized { 1.0 } else { 0.25 })
+                .opacity(if emphasized { 1.0 } else { 0.35 })
                 .child(svg().path(icon_for(action)).size(px(14.)).text_color(color));
             if enabled {
+                let hover = if action == ActionKind::Remove {
+                    theme.error_soft
+                } else {
+                    theme.hover
+                };
                 button = button
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme.hover))
+                    .hover(move |style| style.bg(hover))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.request_action(kind, &id_owned, &title_owned, action);
                         cx.notify();
@@ -1034,23 +1057,19 @@ impl RootView {
         let (menu_x, menu_y) = crate::ui::mutations::clamp_menu_position(
             f32::from(menu.at.x),
             f32::from(menu.at.y),
-            200.0,
-            240.0,
+            216.0,
+            320.0,
             f32::from(viewport.width),
             f32::from(viewport.height),
         );
 
-        let backdrop = div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _event, _window, cx| {
-                    this.mutations.row_menu = None;
-                    cx.notify();
-                }),
-            );
+        let backdrop = div().absolute().inset_0().occlude().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _event, _window, cx| {
+                this.mutations.row_menu = None;
+                cx.notify();
+            }),
+        );
 
         let menu_kind = menu.kind;
         let menu_id = menu.id.clone();
@@ -1059,15 +1078,16 @@ impl RootView {
             .absolute()
             .left(px(menu_x))
             .top(px(menu_y))
-            .w(px(200.))
-            .p_1()
+            .w(px(216.))
+            .p(px(6.))
             .occlude()
             .flex()
             .flex_col()
-            .rounded_md()
+            .gap(px(1.))
+            .rounded(px(14.))
             .bg(theme.panel)
             .border_1()
-            .border_color(theme.border)
+            .border_color(theme.border_subtle)
             .shadow_lg();
 
         panel = panel.child(row_menu_item(
@@ -1115,70 +1135,86 @@ impl RootView {
                 &theme,
                 cx,
                 move |this, _cx| {
-                    this.request_action(
-                        remove_kind,
-                        &remove_id,
-                        &remove_title,
-                        ActionKind::Remove,
-                    );
+                    this.request_action(remove_kind, &remove_id, &remove_title, ActionKind::Remove);
                     this.mutations.row_menu = None;
                 },
             ));
         }
 
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .child(backdrop)
-                .child(panel),
-        )
+        Some(div().absolute().inset_0().child(backdrop).child(panel))
     }
 
     fn render_toast(&mut self, cx: &mut Context<Self>) -> Option<Div> {
         let toast = self.mutations.toast.clone()?;
         let theme = self.theme.clone();
-        let border = if toast.error { theme.error } else { theme.border };
         let text_color = if toast.error { theme.error } else { theme.text };
+        let (icon, icon_color, icon_bg) = if toast.error {
+            ("icons/alert.svg", theme.error, theme.error_soft)
+        } else {
+            ("icons/check.svg", theme.running, theme.running_soft)
+        };
         Some(
             div()
                 .absolute()
-                .bottom(px(16.))
+                .bottom(px(24.))
                 .left_0()
                 .right_0()
                 .flex()
                 .justify_center()
                 .child(
                     div()
-                        .w(px(420.))
-                        .px_3()
-                        .py_2()
+                        .w(px(440.))
+                        .p(px(12.))
                         .occlude()
-                        .rounded_md()
-                        .bg(theme.panel)
+                        .rounded(px(14.))
+                        .bg(theme.panel_raised)
                         .border_1()
-                        .border_color(border)
+                        .border_color(theme.border_subtle)
+                        .shadow_lg()
                         .flex()
                         .items_center()
-                        .gap_3()
+                        .gap(px(12.))
+                        .child(
+                            div()
+                                .size(px(28.))
+                                .rounded(px(8.))
+                                .flex_shrink_0()
+                                .bg(icon_bg)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(svg().path(icon).size(px(15.)).text_color(icon_color)),
+                        )
                         .child(
                             div()
                                 .flex_1()
-                                .text_sm()
+                                .min_w(px(0.))
+                                .text_size(px(12.))
+                                .line_height(px(17.))
                                 .text_color(text_color)
                                 .child(toast.text),
                         )
                         .child(
                             div()
                                 .id("toast-close")
+                                .size(px(24.))
+                                .flex_shrink_0()
+                                .rounded(px(6.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
                                 .cursor_pointer()
-                                .text_color(theme.text_dim)
-                                .hover(|style| style.text_color(theme.text))
+                                .hover(|style| style.bg(theme.hover))
                                 .on_click(cx.listener(|this, _event, _window, cx| {
                                     this.mutations.toast = None;
                                     cx.notify();
                                 }))
-                                .child("×"),
+                                .child(
+                                    svg()
+                                        .path("icons/close.svg")
+                                        .size(px(13.))
+                                        .text_color(theme.text_dim),
+                                ),
                         ),
                 ),
         )
@@ -1201,8 +1237,9 @@ impl RootView {
             return;
         }
         detail.tab = tab;
-        let needs_logs =
-            tab == DetailTab::Logs && !detail.logs_requested && detail.kind == ResourceKind::Container;
+        let needs_logs = tab == DetailTab::Logs
+            && !detail.logs_requested
+            && detail.kind == ResourceKind::Container;
         if needs_logs {
             detail.logs_requested = true;
             let id = detail.id.clone();
@@ -1212,35 +1249,258 @@ impl RootView {
         }
     }
 
-    fn render_detail(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_detail(&mut self, layout: &Layout, cx: &mut Context<Self>) -> Div {
         let theme = self.theme.clone();
         let Some(detail) = self.detail.clone() else {
             return div();
         };
+        let page = page_for_kind(detail.kind);
+
+        let container = if detail.kind == ResourceKind::Container {
+            self.snapshot
+                .containers
+                .iter()
+                .find(|container| container.id == detail.id)
+                .cloned()
+        } else {
+            None
+        };
+        let image = if detail.kind == ResourceKind::Image {
+            self.snapshot
+                .images
+                .iter()
+                .find(|image| image.id == detail.id)
+                .cloned()
+        } else {
+            None
+        };
+        let volume = if detail.kind == ResourceKind::Volume {
+            self.snapshot
+                .volumes
+                .iter()
+                .find(|volume| volume.name.as_ref() == detail.id)
+                .cloned()
+        } else {
+            None
+        };
+        let state = container.as_ref().map(|container| container.state);
+
+        let mut meta = div().flex().items_center().gap(px(8.));
+        if let Some(state) = state {
+            meta = meta.child(state_pill_inline(state, &theme));
+        }
+        if let Some(container) = &container {
+            meta = meta
+                .child(meta_dot(&theme))
+                .child(
+                    div()
+                        .font_family("JetBrains Mono")
+                        .text_size(px(11.))
+                        .text_color(theme.text_dim)
+                        .child(container.short_id.clone()),
+                )
+                .child(meta_dot(&theme))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.text_dim)
+                        .child(container.image.clone()),
+                )
+                .child(meta_dot(&theme))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.text_faint)
+                        .child(container.created_label.clone()),
+                );
+        } else if let Some(image) = &image {
+            meta = meta
+                .child(meta_dot(&theme))
+                .child(
+                    div()
+                        .font_family("JetBrains Mono")
+                        .text_size(px(11.))
+                        .text_color(theme.text_dim)
+                        .child(image.short_id.clone()),
+                )
+                .child(meta_dot(&theme))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.text_dim)
+                        .child(image.size_label.clone()),
+                )
+                .child(meta_dot(&theme))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.text_faint)
+                        .child(image.created_label.clone()),
+                );
+        } else if let Some(volume) = &volume {
+            meta = meta
+                .child(meta_dot(&theme))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.text_dim)
+                        .child(volume.driver.clone()),
+                )
+                .child(meta_dot(&theme))
+                .child(
+                    div()
+                        .max_w(px(420.))
+                        .truncate()
+                        .font_family("JetBrains Mono")
+                        .text_size(px(11.))
+                        .text_color(theme.text_dim)
+                        .child(volume.mountpoint.clone()),
+                )
+                .child(meta_dot(&theme))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.text_faint)
+                        .child(volume.created_label.clone()),
+                );
+        }
+
+        let pending = self
+            .mutations
+            .pending
+            .get(&(detail.kind, detail.id.clone()))
+            .copied();
+        let pending_label = pending.map(|action| action.action.pending_label());
+
+        let mut hero_actions = div().flex().items_center().gap(px(4.)).flex_shrink_0();
+        if detail.kind == ResourceKind::Container {
+            for (action, label) in [
+                (ActionKind::Start, "Start"),
+                (ActionKind::Stop, "Stop"),
+                (ActionKind::Restart, "Restart"),
+            ] {
+                let enabled = action_enabled(state, detail.kind, action) && pending.is_none();
+                let id = detail.id.clone();
+                let title = detail.title.to_string();
+                hero_actions = hero_actions.child(button(
+                    SharedString::from(format!("detail-action-{}", action.verb())),
+                    ButtonSpec::ghost(label, Some(icon_for(action)), enabled),
+                    &theme,
+                    cx,
+                    move |this, _window, _cx| {
+                        this.request_action(detail.kind, &id, &title, action);
+                    },
+                ));
+            }
+        }
+        let remove_enabled = pending.is_none();
+        let id = detail.id.clone();
+        let title = detail.title.to_string();
+        let kind = detail.kind;
+        hero_actions = hero_actions.child(button(
+            "detail-remove",
+            ButtonSpec::danger("Remove", Some("icons/trash.svg"), remove_enabled),
+            &theme,
+            cx,
+            move |this, _window, _cx| {
+                this.request_action(kind, &id, &title, ActionKind::Remove);
+            },
+        ));
+
+        let mut action_column = div()
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap(px(4.))
+            .child(hero_actions);
+        if let Some(label) = pending_label {
+            action_column = action_column.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.paused)
+                    .child(label),
+            );
+        }
+
+        let hero = crate::ui::style::card(&theme)
+            .p(px(20.))
+            .flex()
+            .items_center()
+            .gap(px(16.))
+            .child(
+                div()
+                    .size(px(44.))
+                    .rounded(px(12.))
+                    .bg(theme.panel_raised)
+                    .border_1()
+                    .border_color(theme.border_subtle)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .flex_shrink_0()
+                    .child(
+                        svg()
+                            .path(page_icon(page))
+                            .size(px(22.))
+                            .text_color(theme.accent),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(22.))
+                            .line_height(px(26.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child(detail.title.clone()),
+                    )
+                    .child(meta),
+            )
+            .child(action_column);
 
         let tabs: Vec<DetailTab> = if detail.kind == ResourceKind::Container {
             vec![DetailTab::Inspect, DetailTab::Logs]
         } else {
             vec![DetailTab::Inspect]
         };
-
-        let mut tab_strip = div().flex().items_center().gap_1().px_3().h(px(36.)).border_b_1().border_color(theme.border);
+        let mut tab_strip = div()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .p(px(3.))
+            .rounded(px(10.))
+            .bg(theme.bg)
+            .border_1()
+            .border_color(theme.border_subtle);
         for tab in tabs {
             let selected = detail.tab == tab;
             let label = match tab {
                 DetailTab::Inspect => "Inspect",
                 DetailTab::Logs => "Logs",
             };
-            let color = if selected { theme.text } else { theme.text_dim };
             tab_strip = tab_strip.child(
                 div()
                     .id(SharedString::from(format!("tab-{label}")))
-                    .px_3()
-                    .h_full()
+                    .px(px(12.))
+                    .h(px(30.))
                     .flex()
                     .items_center()
-                    .text_sm()
-                    .text_color(color)
+                    .rounded(px(7.))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .bg(if selected {
+                        theme.panel_raised
+                    } else {
+                        theme.bg
+                    })
+                    .text_color(if selected { theme.text } else { theme.text_dim })
                     .cursor_pointer()
                     .hover(|s| s.text_color(theme.text))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
@@ -1251,168 +1511,218 @@ impl RootView {
             );
         }
 
-        let status = if detail.missing {
-            Some("no longer exists".to_string())
-        } else {
-            None
-        };
-        let pending_label = self
-            .mutations
-            .pending
-            .get(&(detail.kind, detail.id.clone()))
-            .map(|action| action.action.pending_label());
+        let body: gpui::AnyElement =
+            if let Some(error) = detail.error.clone() {
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(10.))
+                    .px_8()
+                    .text_center()
+                    .child(
+                        div()
+                            .size(px(40.))
+                            .rounded(px(10.))
+                            .bg(theme.error_soft)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                svg()
+                                    .path("icons/alert.svg")
+                                    .size(px(20.))
+                                    .text_color(theme.error),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child("Could not load this resource"),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(420.))
+                            .text_size(px(12.))
+                            .text_color(theme.text_dim)
+                            .child(error),
+                    )
+                    .child(button(
+                        "detail-retry",
+                        ButtonSpec::ghost("Retry", None, true),
+                        &theme,
+                        cx,
+                        |this, _window, _cx| this.retry_detail(),
+                    ))
+                    .into_any_element()
+            } else if detail.missing {
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(10.))
+                    .px_8()
+                    .text_center()
+                    .child(
+                        div()
+                            .size(px(40.))
+                            .rounded(px(10.))
+                            .bg(theme.panel_raised)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                svg()
+                                    .path("icons/alert.svg")
+                                    .size(px(20.))
+                                    .text_color(theme.text_faint),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child(format!("{} no longer exists", detail.title)),
+                    )
+                    .child(div().text_size(px(12.)).text_color(theme.text_dim).child(
+                        "It may have been removed on the host. Go back to refresh the list.",
+                    ))
+                    .into_any_element()
+            } else {
+                match detail.tab {
+                    DetailTab::Inspect => match &detail.inspect {
+                        Some(nodes) => render_inspect_cards(nodes, &theme).into_any_element(),
+                        None => loading_body("Loading inspect…", &theme),
+                    },
+                    DetailTab::Logs => match &detail.logs {
+                        Some(lines) => {
+                            let line_count = lines.len();
+                            let stderr_count = lines.iter().filter(|line| line.stderr).count();
+                            div()
+                                .flex_1()
+                                .min_h(px(0.))
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .h(px(44.))
+                                        .px(px(16.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .border_b_1()
+                                        .border_color(theme.border_subtle)
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(12.))
+                                                .child(
+                                                    div()
+                                                        .text_size(px(11.))
+                                                        .text_color(theme.text_dim)
+                                                        .child(format!("{line_count} lines")),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(11.))
+                                                        .text_color(if stderr_count > 0 {
+                                                            theme.paused
+                                                        } else {
+                                                            theme.text_faint
+                                                        })
+                                                        .child(format!("{stderr_count} stderr")),
+                                                ),
+                                        )
+                                        .child(button(
+                                            "logs-refresh",
+                                            ButtonSpec::ghost(
+                                                "Reload",
+                                                Some("icons/refresh.svg"),
+                                                true,
+                                            ),
+                                            &theme,
+                                            cx,
+                                            |this, _window, _cx| this.request_detail_refresh(),
+                                        )),
+                                )
+                                .child(render_logs(lines, &theme))
+                                .into_any_element()
+                        }
+                        None => loading_body("Loading logs…", &theme),
+                    },
+                }
+            };
 
-        let body: gpui::AnyElement = if let Some(error) = detail.error.clone() {
-            div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .px_8()
-                .text_center()
-                .child(div().text_sm().text_color(theme.error).child(error))
-                .child(
-                    div()
-                        .id("detail-retry")
-                        .px_3()
-                        .py_1()
-                        .rounded_md()
-                        .text_xs()
-                        .text_color(theme.text)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.hover))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.retry_detail();
-                            cx.notify();
-                        }))
-                        .child("Retry"),
-                )
-                .into_any_element()
-        } else if detail.missing {
-            div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_sm()
-                .text_color(theme.text_dim)
-                .child(format!("{} no longer exists", detail.title))
-                .into_any_element()
-        } else {
-            match detail.tab {
-                DetailTab::Inspect => match &detail.inspect {
-                    Some(nodes) => render_inspect_tree(nodes, &theme).into_any_element(),
-                    None => div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_sm()
-                        .text_color(theme.text_dim)
-                        .child("Loading inspect…")
-                        .into_any_element(),
-                },
-                DetailTab::Logs => match &detail.logs {
-                    Some(lines) => render_logs(lines, &theme).into_any_element(),
-                    None => div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_sm()
-                        .text_color(theme.text_dim)
-                        .child("Loading logs…")
-                        .into_any_element(),
-                },
-            }
-        };
-
-        let back_label = format!("‹ {}", self.page.title());
+        let host_chip = self.render_host_chip(cx);
         div()
             .size_full()
             .flex()
             .flex_col()
             .child(
                 div()
-                    .h(px(56.))
-                    .px_4()
+                    .h(px(60.))
+                    .px(px(layout.page_padding))
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .justify_between()
                     .border_b_1()
-                    .border_color(theme.border)
+                    .border_color(theme.border_subtle)
                     .child(
                         div()
-                            .id("back")
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .text_sm()
-                            .text_color(theme.text_dim)
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme.hover))
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.close_detail();
-                                cx.notify();
-                            }))
-                            .child(back_label),
-                    )
-                    .child(div().text_base().child(detail.title.clone()))
-                    .child({
-                        let state = if detail.kind == ResourceKind::Container {
-                            self.snapshot
-                                .containers
-                                .iter()
-                                .find(|container| container.id == detail.id)
-                                .map(|container| container.state)
-                        } else {
-                            None
-                        };
-                        div()
-                            .w(px(actions_width(detail.kind)))
-                            .child(self.render_action_buttons(
-                                detail.kind,
-                                &detail.id,
-                                detail.title.as_ref(),
-                                state,
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(crate::ui::widgets::button::icon_button(
+                                "back",
+                                "icons/back.svg",
+                                28.0,
+                                theme.text_dim,
+                                false,
                                 true,
+                                true,
+                                &theme,
                                 cx,
+                                |this, _window, _cx| this.close_detail(),
                             ))
-                    })
-                    .when_some(pending_label, |this, label| {
-                        this.child(div().text_xs().text_color(theme.paused).child(label))
-                    })
-                    .when(detail.tab == DetailTab::Logs, |this| {
-                        this.child(
-                            div()
-                                .id("logs-refresh")
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .text_xs()
-                                .text_color(theme.text_dim)
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme.hover))
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    this.request_detail_refresh();
-                                    cx.notify();
-                                }))
-                                .child("Reload"),
-                        )
-                    })
-                    .when_some(status, |this, status| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.paused)
-                                .child(status),
-                        )
-                    }),
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.text)
+                                    .child(page.title()),
+                            ),
+                    )
+                    .child(host_chip),
             )
-            .child(tab_strip)
-            .child(body)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(if layout.compact { 12. } else { 14. }))
+                    .px(px(layout.page_padding))
+                    .pt(px(if layout.compact { 16. } else { 20. }))
+                    .pb(px(layout.page_padding))
+                    .child(hero)
+                    .child(tab_strip)
+                    .child(
+                        crate::ui::style::card(&theme)
+                            .flex_1()
+                            .min_h(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(body),
+                    ),
+            )
     }
 
     pub(crate) fn start_pull(&mut self, reference: &str, origin: PullOrigin) -> bool {
@@ -1483,22 +1793,22 @@ impl RootView {
         ))
     }
 
-    fn render_pull_strip(&mut self) -> Option<Div> {
+    fn render_pull_strip(&mut self, layout: &Layout) -> Option<Div> {
         let pull = self.mutations.pull.clone()?;
         let theme = self.theme.clone();
         let bytes = pull.bytes();
         let fraction = pull.fraction();
 
         let mut strip = div()
-            .h(px(32.))
-            .px_4()
+            .h(px(36.))
+            .px(px(layout.page_padding))
             .flex()
             .items_center()
-            .gap_3()
-            .bg(theme.panel)
+            .gap(px(12.))
+            .bg(theme.accent_soft)
             .border_b_1()
             .border_color(theme.border)
-            .text_xs()
+            .text_size(px(12.))
             .child(div().text_color(theme.text_dim).child("Pulling"))
             .child(
                 div()
@@ -1507,15 +1817,11 @@ impl RootView {
                     .child(pull.reference.clone()),
             );
         if let Some((current, total)) = bytes {
-            strip = strip.child(
-                div()
-                    .text_color(theme.text_dim)
-                    .child(format!(
-                        "{} / {}",
-                        format_bytes(current as i64),
-                        format_bytes(total as i64)
-                    )),
-            );
+            strip = strip.child(div().text_color(theme.text_dim).child(format!(
+                "{} / {}",
+                format_bytes(current as i64),
+                format_bytes(total as i64)
+            )));
         }
         strip = strip.child(
             div()
@@ -1527,14 +1833,14 @@ impl RootView {
         if let Some(fraction) = fraction {
             strip = strip.child(
                 div()
-                    .w(px(160.))
-                    .h(px(3.))
+                    .w(px(120.))
+                    .h(px(4.))
                     .rounded_full()
                     .bg(theme.border)
                     .child(
                         div()
                             .h_full()
-                            .w(px(160. * fraction))
+                            .w(px(120. * fraction))
                             .rounded_full()
                             .bg(theme.accent),
                     ),
@@ -1643,19 +1949,31 @@ impl RootView {
             RunField::Name => Some(&mut run.form.name),
             RunField::Command => Some(&mut run.form.command),
             RunField::PortHost(index) => run.form.ports.get_mut(index).map(|port| &mut port.host),
-            RunField::PortContainer(index) => {
-                run.form.ports.get_mut(index).map(|port| &mut port.container)
-            }
-            RunField::EnvKey(index) => run.form.env.get_mut(index).map(|variable| &mut variable.key),
-            RunField::EnvValue(index) => {
-                run.form.env.get_mut(index).map(|variable| &mut variable.value)
-            }
-            RunField::MountSource(index) => {
-                run.form.mounts.get_mut(index).map(|mount| &mut mount.source)
-            }
-            RunField::MountTarget(index) => {
-                run.form.mounts.get_mut(index).map(|mount| &mut mount.target)
-            }
+            RunField::PortContainer(index) => run
+                .form
+                .ports
+                .get_mut(index)
+                .map(|port| &mut port.container),
+            RunField::EnvKey(index) => run
+                .form
+                .env
+                .get_mut(index)
+                .map(|variable| &mut variable.key),
+            RunField::EnvValue(index) => run
+                .form
+                .env
+                .get_mut(index)
+                .map(|variable| &mut variable.value),
+            RunField::MountSource(index) => run
+                .form
+                .mounts
+                .get_mut(index)
+                .map(|mount| &mut mount.source),
+            RunField::MountTarget(index) => run
+                .form
+                .mounts
+                .get_mut(index)
+                .map(|mount| &mut mount.target),
         }
     }
 
@@ -1671,7 +1989,9 @@ impl RootView {
             if run.submitting {
                 return;
             }
-            run.form.ports.push(crate::docker::actions::PortForm::default());
+            run.form
+                .ports
+                .push(crate::docker::actions::PortForm::default());
         }
         if let Some(focus) = &mut self.run_focus {
             focus.add_port(cx);
@@ -1706,7 +2026,9 @@ impl RootView {
             if run.submitting {
                 return;
             }
-            run.form.env.push(crate::docker::actions::EnvForm::default());
+            run.form
+                .env
+                .push(crate::docker::actions::EnvForm::default());
         }
         if let Some(focus) = &mut self.run_focus {
             focus.add_env(cx);
@@ -1730,7 +2052,9 @@ impl RootView {
             if run.submitting {
                 return;
             }
-            run.form.mounts.push(crate::docker::actions::MountForm::default());
+            run.form
+                .mounts
+                .push(crate::docker::actions::MountForm::default());
         }
         if let Some(focus) = &mut self.run_focus {
             focus.add_mount(cx);
@@ -1791,217 +2115,405 @@ impl RootView {
         ))
     }
 
-    fn render_rail(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_rail(&mut self, layout: &Layout, cx: &mut Context<Self>) -> Div {
         let theme = self.theme.clone();
         let mut rail = div()
-            .w(px(56.))
+            .w(px(layout.rail_width))
             .h_full()
             .flex()
             .flex_col()
             .items_center()
-            .py_3()
-            .gap_2()
-            .bg(theme.panel)
+            .pt(px(20.))
+            .pb(px(16.))
+            .bg(theme.rail)
             .border_r_1()
-            .border_color(theme.border);
+            .border_color(theme.border_subtle);
+
+        rail = rail.child(
+            div()
+                .size(px(32.))
+                .rounded(px(10.))
+                .bg(theme.accent_soft)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    svg()
+                        .path("icons/containers.svg")
+                        .size(px(18.))
+                        .text_color(theme.accent),
+                ),
+        );
+        rail = rail.child(div().h(px(26.)));
+
+        let mut nav = div().w_full().flex().flex_col().items_center().gap(px(8.));
 
         for page in [Page::Containers, Page::Images, Page::Volumes] {
             let selected = self.page == page;
-            let bg = if selected { theme.selected } else { theme.panel };
-            let fg = if selected { theme.text } else { theme.text_dim };
-            rail = rail.child(
-                div()
-                    .id(("rail", page.index()))
-                    .size(px(38.))
-                    .rounded_md()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(bg)
-                    .text_color(fg)
-                    .text_sm()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.hover))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.switch_page(page);
-                        cx.notify();
-                    }))
-                    .child(page.initial()),
+            let fg = if selected {
+                theme.accent
+            } else {
+                theme.text_dim
+            };
+            let label_color = if selected {
+                theme.accent
+            } else {
+                theme.text_faint
+            };
+            let mut item = div()
+                .id(("rail", page.index()))
+                .relative()
+                .w(px(60.))
+                .h(px(54.))
+                .rounded(px(10.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(4.))
+                .bg(if selected { theme.selected } else { theme.rail })
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.hover))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.switch_page(page);
+                    cx.notify();
+                }));
+
+            if selected {
+                item = item.child(
+                    div()
+                        .absolute()
+                        .left(px(-8.))
+                        .top(px(10.))
+                        .bottom(px(10.))
+                        .w(px(3.))
+                        .rounded_r(px(3.))
+                        .bg(theme.accent),
+                );
+            }
+
+            nav = nav.child(
+                item.child(svg().path(page_icon(page)).size(px(20.)).text_color(fg))
+                    .child(
+                        div()
+                            .text_size(px(9.))
+                            .line_height(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(label_color)
+                            .child(page.title().to_uppercase()),
+                    ),
             );
         }
+        rail = rail.child(nav);
 
         rail.child(div().flex_1()).child(
             div()
-                .size(px(10.))
-                .rounded_full()
-                .bg(self.status_color()),
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(4.))
+                .child(div().size(px(8.)).rounded_full().bg(self.status_color()))
+                .child(
+                    div()
+                        .text_size(px(9.))
+                        .line_height(px(11.))
+                        .text_color(theme.text_faint)
+                        .child("HOST"),
+                ),
         )
     }
 
-    fn render_header(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_host_chip(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let theme = self.theme.clone();
+        let status_color = self.status_color();
+        let host_name = self.active_host_name();
+        div()
+            .id("host-chip")
+            .h(px(32.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .rounded(px(10.))
+            .bg(theme.panel)
+            .border_1()
+            .border_color(theme.border)
+            .text_size(px(12.))
+            .text_color(theme.text)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.hover))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.host_menu_open = !this.host_menu_open;
+                this.mutations.pull_open = false;
+                if this.host_menu_open {
+                    if let Some(service) = &this.service {
+                        service.request(Request::ProbeHosts);
+                    }
+                }
+                cx.notify();
+            }))
+            .child(div().size(px(8.)).rounded_full().bg(status_color))
+            .child(host_name)
+            .child(
+                svg()
+                    .path("icons/chevron-down.svg")
+                    .size(px(14.))
+                    .text_color(theme.text_dim),
+            )
+    }
+
+    fn render_header(&mut self, layout: &Layout, cx: &mut Context<Self>) -> Div {
         let theme = self.theme.clone();
         let query = self.current_table().query.clone();
 
-        let search = div()
+        let mut search = div()
             .id("search")
-            .w(px(240.))
-            .h(px(28.))
-            .px_2()
+            .w(px(if layout.compact { 200. } else { 260. }))
+            .h(px(32.))
+            .px(px(10.))
             .flex()
             .items_center()
-            .rounded_md()
+            .gap(px(6.))
+            .rounded(px(10.))
             .bg(theme.bg)
             .border_1()
             .border_color(theme.border)
-            .text_sm()
             .track_focus(&self.search_focus)
             .cursor_text()
             .on_click(cx.listener(|this, _event, window, _cx| {
                 window.focus(&this.search_focus);
             }))
             .on_key_down(cx.listener(|this, event, _window, cx| this.on_search_key(event, cx)))
-            .child(if query.is_empty() {
-                div()
-                    .text_color(theme.text_dim)
-                    .child("Search  ⌘F")
-                    .into_any_element()
-            } else {
-                div().text_color(theme.text).child(query).into_any_element()
-            });
+            .child(
+                svg()
+                    .path("icons/search.svg")
+                    .size(px(14.))
+                    .text_color(theme.text_faint),
+            );
+        search = search.child(if query.is_empty() {
+            div()
+                .flex_1()
+                .truncate()
+                .text_size(px(13.))
+                .text_color(theme.text_dim)
+                .child("Search")
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .truncate()
+                .text_size(px(13.))
+                .text_color(theme.text)
+                .child(query)
+                .into_any_element()
+        });
+        search = search.child(
+            div()
+                .px(px(5.))
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(theme.border)
+                .text_size(px(9.))
+                .text_color(theme.text_faint)
+                .child("⌘F"),
+        );
 
         let pulling = self.mutations.pull.is_some();
-        let pull_color = if pulling { theme.text_dim } else { theme.text };
-        let mut pull_button = div()
-            .id("pull-button")
-            .h(px(28.))
-            .px_2()
-            .flex()
-            .items_center()
-            .gap_1()
-            .rounded_md()
-            .text_sm()
-            .text_color(pull_color)
-            .child(svg().path("icons/pull.svg").size(px(14.)).text_color(pull_color))
-            .child(if pulling { "Pulling…" } else { "Pull" });
-        if !pulling {
-            pull_button = pull_button
-                .cursor_pointer()
-                .hover(|style| style.bg(theme.hover))
-                .on_click(cx.listener(|this, _event, window, cx| {
+        let run_open = self.mutations.run.is_some();
+
+        let mut actions = div().flex().items_center().gap(px(8.));
+        if self.page == Page::Containers {
+            actions = actions.child(button(
+                "run-button",
+                ButtonSpec::primary("Run", Some("icons/run.svg"), !run_open),
+                &theme,
+                cx,
+                |this, window, cx| {
+                    this.open_run(None, window, cx);
+                    cx.notify();
+                },
+            ));
+        }
+        if self.page == Page::Images {
+            actions = actions.child(button(
+                "pull-button",
+                ButtonSpec::primary(
+                    if pulling { "Pulling…" } else { "Pull" },
+                    Some("icons/pull.svg"),
+                    !pulling,
+                ),
+                &theme,
+                cx,
+                |this, window, _cx| {
                     this.mutations.pull_open = !this.mutations.pull_open;
                     this.host_menu_open = false;
                     if this.mutations.pull_open {
                         window.focus(&this.pull_focus);
                     }
-                    cx.notify();
-                }));
+                },
+            ));
         }
-
-        let run_dialog_open = self.mutations.run.is_some();
-        let run_color = if run_dialog_open { theme.text_dim } else { theme.text };
-        let mut run_button = div()
-            .id("run-button")
-            .h(px(28.))
-            .px_2()
-            .flex()
-            .items_center()
-            .gap_1()
-            .rounded_md()
-            .text_sm()
-            .text_color(run_color)
-            .child(svg().path("icons/run.svg").size(px(14.)).text_color(run_color))
-            .child("Run");
-        if !run_dialog_open {
-            run_button = run_button
-                .cursor_pointer()
-                .hover(|style| style.bg(theme.hover))
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.open_run(None, window, cx);
-                    cx.notify();
-                }));
-        }
+        actions = actions
+            .child(search)
+            .child(crate::ui::widgets::button::icon_button(
+                "refresh",
+                "icons/refresh.svg",
+                32.0,
+                theme.text_dim,
+                false,
+                true,
+                true,
+                &theme,
+                cx,
+                |this, _window, _cx| this.refresh(),
+            ))
+            .child(self.render_host_chip(cx));
 
         div()
-            .h(px(56.))
-            .px_4()
+            .h(px(layout.top_bar_height))
+            .px(px(layout.page_padding))
             .flex()
             .items_center()
             .justify_between()
             .border_b_1()
-            .border_color(theme.border)
+            .border_color(theme.border_subtle)
             .child(
                 div()
                     .flex()
-                    .items_baseline()
-                    .gap_3()
-                    .child(div().text_base().child(self.page.title()))
+                    .flex_col()
+                    .gap(px(2.))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(theme.text_dim)
-                            .child(self.counts()),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .when(self.page == Page::Containers, |this| this.child(run_button))
-                    .when(self.page == Page::Images, |this| this.child(pull_button))
-                    .child(search)
-                    .child(
-                        div()
-                            .id("refresh")
-                            .size(px(28.))
-                            .rounded_md()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(theme.text_dim)
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme.hover))
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.refresh();
-                                cx.notify();
-                            }))
-                            .child("⟳"),
+                            .text_size(px(18.))
+                            .line_height(px(22.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child(self.page.title()),
                     )
                     .child(
                         div()
-                            .id("host-chip")
-                            .h(px(28.))
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .rounded_md()
-                            .bg(theme.bg)
-                            .border_1()
-                            .border_color(theme.border)
-                            .text_sm()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme.hover))
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.host_menu_open = !this.host_menu_open;
-                                this.mutations.pull_open = false;
-                                if this.host_menu_open {
-                                    if let Some(service) = &this.service {
-                                        service.request(Request::ProbeHosts);
-                                    }
-                                }
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .size(px(8.))
-                                    .rounded_full()
-                                    .bg(self.status_color()),
-                            )
-                            .child(self.active_host_name()),
+                            .text_size(px(11.))
+                            .line_height(px(14.))
+                            .text_color(theme.text_dim)
+                            .child(self.subtitle()),
                     ),
             )
+            .child(actions)
+    }
 
+    fn render_overview(&mut self, layout: &Layout, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme.clone();
+        let stats = self.stats.clone();
+        let loading = stats.is_loading();
+        let page = self.page;
+
+        let containers = stat_card(
+            StatCard {
+                id: "overview-containers",
+                kicker: "Containers",
+                icon: "icons/containers.svg",
+                value: if loading {
+                    "—".to_string()
+                } else {
+                    stats.containers_running.to_string()
+                },
+                unit: "running",
+                right: if loading {
+                    "of —".to_string()
+                } else {
+                    format!("of {}", stats.containers_total)
+                },
+                foot: if loading {
+                    "connecting…".to_string()
+                } else {
+                    format!("{} stopped", stats.containers_stopped)
+                },
+                progress: if loading {
+                    None
+                } else {
+                    Some(stats.containers_share())
+                },
+                active: page == Page::Containers,
+            },
+            layout,
+            &theme,
+            cx,
+            |this, _window, _cx| this.switch_page(Page::Containers),
+        );
+
+        let images = stat_card(
+            StatCard {
+                id: "overview-images",
+                kicker: "Images",
+                icon: "icons/images.svg",
+                value: if loading {
+                    "—".to_string()
+                } else {
+                    stats.images_total.to_string()
+                },
+                unit: "images",
+                right: if loading {
+                    "— in use".to_string()
+                } else {
+                    format!("{} in use", stats.images_in_use)
+                },
+                foot: if loading {
+                    "connecting…".to_string()
+                } else {
+                    format!("{} total", stats.images_size_label)
+                },
+                progress: None,
+                active: page == Page::Images,
+            },
+            layout,
+            &theme,
+            cx,
+            |this, _window, _cx| this.switch_page(Page::Images),
+        );
+
+        let volumes = stat_card(
+            StatCard {
+                id: "overview-volumes",
+                kicker: "Volumes",
+                icon: "icons/volumes.svg",
+                value: if loading {
+                    "—".to_string()
+                } else {
+                    stats.volumes_total.to_string()
+                },
+                unit: if stats.volumes_total == 1 {
+                    "volume"
+                } else {
+                    "volumes"
+                },
+                right: if loading {
+                    "—".to_string()
+                } else {
+                    stats.volume_driver_label()
+                },
+                foot: if loading {
+                    "connecting…".to_string()
+                } else {
+                    stats.volume_foot()
+                },
+                progress: None,
+                active: page == Page::Volumes,
+            },
+            layout,
+            &theme,
+            cx,
+            |this, _window, _cx| this.switch_page(Page::Volumes),
+        );
+
+        div()
+            .flex()
+            .gap(px(12.))
+            .child(containers)
+            .child(images)
+            .child(volumes)
     }
 
     fn render_host_menu(&mut self, cx: &mut Context<Self>) -> Option<Div> {
@@ -2011,14 +2523,14 @@ impl RootView {
         let theme = self.theme.clone();
         let mut menu = div()
             .absolute()
-            .top(px(60.))
+            .top(px(64.))
             .right(px(16.))
-            .w(px(360.))
-            .p_2()
+            .w(px(380.))
+            .p(px(8.))
             .flex()
             .flex_col()
-            .gap_1()
-            .rounded_md()
+            .gap(px(2.))
+            .rounded(px(14.))
             .bg(theme.panel)
             .border_1()
             .border_color(theme.border)
@@ -2027,8 +2539,8 @@ impl RootView {
         if self.hosts.is_empty() {
             menu = menu.child(
                 div()
-                    .p_2()
-                    .text_sm()
+                    .p(px(12.))
+                    .text_size(px(13.))
                     .text_color(theme.text_dim)
                     .child("No Docker host found"),
             );
@@ -2043,7 +2555,12 @@ impl RootView {
                     HostStatus::Unknown => theme.text_dim,
                     _ => theme.error,
                 };
-                (host.id.clone(), host.name.clone(), host.detail.clone(), color)
+                (
+                    host.id.clone(),
+                    host.name.clone(),
+                    host.detail.clone(),
+                    color,
+                )
             })
             .collect();
 
@@ -2051,89 +2568,116 @@ impl RootView {
 
         for (id, name, detail, color) in items {
             let is_active = active.as_deref() == Some(id.as_str());
-            let bg = if is_active { theme.selected } else { theme.panel };
+            let bg = if is_active {
+                theme.selected
+            } else {
+                theme.panel
+            };
             let click_id = id.clone();
-            menu = menu.child(
-                div()
-                    .id(SharedString::from(format!("host-{id}")))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .bg(bg)
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.hover))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.select_host(&click_id, cx);
-                        cx.notify();
-                    }))
-                    .child(div().size(px(8.)).rounded_full().bg(color))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .child(div().text_sm().child(name))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.text_dim)
-                                    .truncate()
-                                    .child(detail),
-                            ),
-                    ),
-            );
+            let mut row = div()
+                .id(SharedString::from(format!("host-{id}")))
+                .h(px(52.))
+                .px(px(12.))
+                .rounded(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .bg(bg)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.hover))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.select_host(&click_id, cx);
+                    cx.notify();
+                }))
+                .child(div().size(px(8.)).rounded_full().bg(color))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .font_family("JetBrains Mono")
+                                .text_size(px(11.))
+                                .text_color(theme.text_dim)
+                                .truncate()
+                                .child(detail),
+                        ),
+                );
+            if is_active {
+                row = row.child(
+                    svg()
+                        .path("icons/check.svg")
+                        .size(px(16.))
+                        .text_color(theme.accent),
+                );
+            }
+            menu = menu.child(row);
         }
 
         Some(menu)
     }
 
-    fn render_table(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_table(&mut self, layout: &Layout, cx: &mut Context<Self>) -> Div {
         let theme = self.theme.clone();
         let index = self.page.index();
         let table = &self.tables[index];
         let columns: Vec<&'static str> = table.spec.columns.clone();
         let widths = table.spec.widths.clone();
+        let styles = table.spec.styles.clone();
         let active_sort = table.sort;
         let visible_count = table.visible().len();
         let selected = table.selected;
         let actions = table.spec.actions;
+        let row_height = layout.row_height;
+        let cell_padding = layout.cell_padding;
 
         let mut header = div()
-            .h(px(28.))
-            .px_3()
+            .h(px(layout.table_header_height))
+            .px(px(layout.cell_padding))
             .flex()
             .items_center()
             .border_b_1()
-            .border_color(theme.border)
-            .text_xs()
+            .border_color(theme.border_subtle)
+            .text_size(px(10.))
+            .line_height(px(12.))
+            .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme.text_dim);
 
         for (column, title) in columns.iter().enumerate() {
             let width = widths[column];
             let sorted = active_sort.map(|(c, asc)| (c == column, asc));
-            header = header.child(
-                div()
-                    .id(("header", column))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(theme.text))
-                    .map_width(width)
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        let table = this.current_table_mut();
-                        table.click_header(column);
-                        cx.notify();
-                    }))
-                    .child(match sorted {
-                        Some((true, true)) => format!("{title} ↑"),
-                        Some((true, false)) => format!("{title} ↓"),
-                        _ => title.to_string(),
-                    }),
-            );
+            let mut cell = div()
+                .id(("header", column))
+                .h_full()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .cursor_pointer()
+                .hover(|s| s.text_color(theme.text))
+                .map_width(width)
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    let table = this.current_table_mut();
+                    table.click_header(column);
+                    cx.notify();
+                }))
+                .child(SharedString::from(title.to_uppercase()));
+            if let Some((_, ascending)) = sorted {
+                cell = cell.child(div().text_color(theme.accent).child(if ascending {
+                    "↑"
+                } else {
+                    "↓"
+                }));
+            }
+            header = header.child(cell);
         }
 
         if let Some(actions) = actions {
@@ -2148,27 +2692,21 @@ impl RootView {
                 let mut rows = Vec::with_capacity(range.len());
                 let theme = this.theme.clone();
                 for position in range {
-                    let Some(row_index) = this.tables[index]
-                        .visible()
-                        .get(position)
-                        .copied()
+                    let Some(row_index) = this.tables[index].visible().get(position).copied()
                     else {
                         continue;
                     };
-                    let Some((row_id, cells, accent)) = this.tables[index]
+                    let Some((row_id, cells)) = this.tables[index]
                         .rows
                         .get(row_index)
-                        .map(|row| (row.id.clone(), row.cells.clone(), row.accent))
+                        .map(|row| (row.id.clone(), row.cells.clone()))
                     else {
                         continue;
                     };
                     let is_selected = selected == Some(row_index);
                     let kind = actions.map(|actions| actions.kind());
                     let pending = kind.and_then(|kind| {
-                        this.mutations
-                            .pending
-                            .get(&(kind, row_id.clone()))
-                            .copied()
+                        this.mutations.pending.get(&(kind, row_id.clone())).copied()
                     });
                     let hovered_id = row_id.clone();
                     let click_id = row_id.clone();
@@ -2177,14 +2715,24 @@ impl RootView {
 
                     let mut element = div()
                         .id(SharedString::from(format!("row-{row_id}")))
-                        .h(px(ROW_HEIGHT))
-                        .px_3()
+                        .w_full()
+                        .h(px(row_height))
+                        .px(px(cell_padding))
+                        .relative()
                         .flex()
                         .items_center()
-                        .text_sm()
+                        .text_size(px(13.))
                         .cursor_pointer()
-                        .bg(if is_selected { theme.selected } else { theme.bg })
-                        .hover(|style| style.bg(theme.hover))
+                        .border_b_1()
+                        .border_color(theme.border_subtle)
+                        .bg(if is_selected {
+                            theme.selected
+                        } else {
+                            theme.panel
+                        })
+                        .when(!is_selected, |this| {
+                            this.hover(|style| style.bg(theme.hover))
+                        })
                         .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
                             if *hovered {
                                 this.mutations.hovered_row = Some(hovered_id.clone());
@@ -2203,44 +2751,106 @@ impl RootView {
                         .when_some(menu_kind, |this, kind| {
                             this.on_mouse_down(
                                 MouseButton::Right,
-                                cx.listener(move |this, event: &gpui::MouseDownEvent, _window, cx| {
-                                    this.current_table_mut().selected = Some(row_index);
-                                    this.mutations.row_menu = Some(RowMenuState {
-                                        kind,
-                                        id: menu_id.clone(),
-                                        at: event.position,
-                                    });
-                                    cx.notify();
-                                }),
+                                cx.listener(
+                                    move |this, event: &gpui::MouseDownEvent, _window, cx| {
+                                        this.current_table_mut().selected = Some(row_index);
+                                        this.mutations.row_menu = Some(RowMenuState {
+                                            kind,
+                                            id: menu_id.clone(),
+                                            at: event.position,
+                                        });
+                                        cx.notify();
+                                    },
+                                ),
                             )
                         });
 
+                    if is_selected {
+                        element = element.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(3.))
+                                .bg(theme.accent),
+                        );
+                    }
+
                     for (column, cell) in cells.iter().enumerate() {
                         let width = widths[column];
+                        let style = styles.get(column).copied().unwrap_or(CellStyle::Text);
                         let pending_container = kind == Some(ResourceKind::Container)
                             && column == 1
                             && pending.is_some();
-                        let color = if pending_container {
-                            theme.paused
-                        } else if column == 1 {
-                            accent.unwrap_or(theme.text)
-                        } else {
-                            theme.text
-                        };
-                        let text = if pending_container {
-                            pending
-                                .map(|action| action.action.pending_label())
-                                .unwrap_or_default()
-                        } else {
-                            cell.as_ref()
-                        };
-                        element = element.child(
-                            div()
-                                .map_width(width)
-                                .truncate()
-                                .text_color(color)
-                                .child(SharedString::from(text.to_string())),
-                        );
+
+                        if style == CellStyle::Pill {
+                            let state = if kind == Some(ResourceKind::Container) {
+                                this.snapshot
+                                    .containers
+                                    .iter()
+                                    .find(|container| container.id == row_id)
+                                    .map(|container| container.state)
+                            } else {
+                                None
+                            };
+                            let pill = if pending_container {
+                                crate::ui::widgets::pill::pill(
+                                    pending
+                                        .map(|action| action.action.pending_label())
+                                        .unwrap_or_default(),
+                                    theme.paused,
+                                    theme.paused_soft,
+                                )
+                            } else if let Some(state) = state {
+                                state_pill(state, &theme)
+                            } else {
+                                crate::ui::widgets::pill::pill(
+                                    cell.clone(),
+                                    theme.exited,
+                                    theme.exited_soft,
+                                )
+                            };
+                            element = element.child(
+                                div()
+                                    .map_width(width)
+                                    .h_full()
+                                    .flex()
+                                    .items_center()
+                                    .child(pill),
+                            );
+                            continue;
+                        }
+
+                        let mut text = div().map_width(width).truncate().child(cell.clone());
+                        match style {
+                            CellStyle::Text => {
+                                text = text
+                                    .text_size(px(13.))
+                                    .line_height(px(18.))
+                                    .font_weight(if column == 0 {
+                                        FontWeight::MEDIUM
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .text_color(theme.text);
+                            }
+                            CellStyle::Mono => {
+                                text = text
+                                    .font_family("JetBrains Mono")
+                                    .text_size(px(12.))
+                                    .line_height(px(16.))
+                                    .text_color(theme.text_dim);
+                            }
+                            CellStyle::Timestamp => {
+                                text = text
+                                    .text_size(px(11.))
+                                    .line_height(px(14.))
+                                    .text_color(theme.text_dim);
+                            }
+                            CellStyle::Pill => {}
+                        }
+                        element = element.child(text);
                     }
 
                     if let (Some(actions), Some(kind)) = (actions, kind) {
@@ -2254,41 +2864,33 @@ impl RootView {
                             None
                         };
                         let emphasized = is_selected
-                            || this.mutations.hovered_row.as_deref()
-                                == Some(click_id.as_str());
+                            || this.mutations.hovered_row.as_deref() == Some(click_id.as_str());
                         let title = cells
                             .first()
                             .map(|cell| cell.to_string())
                             .unwrap_or_default();
-                        let cluster = this.render_action_buttons(
-                            kind,
-                            &click_id,
-                            &title,
-                            state,
-                            emphasized,
-                            cx,
-                        );
+                        let cluster = this
+                            .render_action_buttons(kind, &click_id, &title, state, emphasized, cx);
                         let cluster_hover_id = click_id.clone();
                         element = element.child(
                             div()
-                                .id(SharedString::from(format!(
-                                    "row-actions-{click_id}"
-                                )))
+                                .id(SharedString::from(format!("row-actions-{click_id}")))
                                 .w(px(actions.width()))
+                                .h_full()
                                 .flex_shrink_0()
-                                .on_hover(cx.listener(
-                                    move |this, hovered: &bool, _window, cx| {
-                                        if *hovered {
-                                            this.mutations.hovered_row =
-                                                Some(cluster_hover_id.clone());
-                                        } else if this.mutations.hovered_row.as_deref()
-                                            == Some(cluster_hover_id.as_str())
-                                        {
-                                            this.mutations.hovered_row = None;
-                                        }
-                                        cx.notify();
-                                    },
-                                ))
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                                    if *hovered {
+                                        this.mutations.hovered_row = Some(cluster_hover_id.clone());
+                                    } else if this.mutations.hovered_row.as_deref()
+                                        == Some(cluster_hover_id.as_str())
+                                    {
+                                        this.mutations.hovered_row = None;
+                                    }
+                                    cx.notify();
+                                }))
                                 .child(cluster),
                         );
                     }
@@ -2302,12 +2904,18 @@ impl RootView {
         .h_full();
 
         let body: gpui::AnyElement = if visible_count == 0 {
-            let (title, detail) = crate::ui::empty::message_for(
-                self.page,
-                &self.status,
-                &self.current_table().query,
-            )
-            .unwrap_or_else(|| (self.page.empty_title().to_string(), String::new()));
+            let query = self.current_table().query.clone();
+            let (title, detail) = crate::ui::empty::message_for(self.page, &self.status, &query)
+                .unwrap_or_else(|| (self.page.empty_title().to_string(), String::new()));
+            let icon = if query.is_empty() {
+                match self.page {
+                    Page::Containers => "icons/containers.svg",
+                    Page::Images => "icons/images.svg",
+                    Page::Volumes => "icons/volumes.svg",
+                }
+            } else {
+                "icons/search.svg"
+            };
             div()
                 .flex_1()
                 .min_h(px(0.))
@@ -2315,21 +2923,45 @@ impl RootView {
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap_1()
+                .gap(px(10.))
                 .px_8()
                 .text_center()
-                .child(div().text_sm().text_color(theme.text).child(title))
-                .child(div().text_xs().text_color(theme.text_dim).child(detail))
+                .child(
+                    div()
+                        .size(px(40.))
+                        .rounded(px(10.))
+                        .bg(theme.panel_raised)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(svg().path(icon).size(px(20.)).text_color(theme.text_faint)),
+                )
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .line_height(px(20.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.text)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .max_w(px(360.))
+                        .text_size(px(12.))
+                        .line_height(px(18.))
+                        .text_color(theme.text_dim)
+                        .child(detail),
+                )
                 .into_any_element()
         } else {
             div().flex_1().min_h(px(0.)).child(list).into_any_element()
         };
 
-        div()
+        crate::ui::style::card(&theme)
             .flex_1()
+            .min_h(px(0.))
             .flex()
             .flex_col()
-            .min_h(px(0.))
             .child(header)
             .child(body)
     }
@@ -2374,14 +3006,6 @@ fn action_enabled(state: Option<ContainerState>, kind: ResourceKind, action: Act
     }
 }
 
-fn actions_width(kind: ResourceKind) -> f32 {
-    match kind {
-        ResourceKind::Container => ActionsColumn::Container.width(),
-        ResourceKind::Image => ActionsColumn::Image.width(),
-        ResourceKind::Volume => ActionsColumn::Volume.width(),
-    }
-}
-
 fn row_menu_item(
     label: &'static str,
     color: gpui::Rgba,
@@ -2391,10 +3015,13 @@ fn row_menu_item(
 ) -> gpui::Stateful<Div> {
     div()
         .id(SharedString::from(format!("row-menu-{label}")))
-        .px_2()
-        .py_1()
-        .rounded_sm()
-        .text_sm()
+        .h(px(32.))
+        .px(px(10.))
+        .flex()
+        .items_center()
+        .rounded(px(8.))
+        .text_size(px(12.))
+        .font_weight(FontWeight::MEDIUM)
         .text_color(color)
         .cursor_pointer()
         .hover(|style| style.bg(theme.hover))
@@ -2405,97 +3032,193 @@ fn row_menu_item(
         .child(label)
 }
 
-fn render_inspect_tree(nodes: &[InspectNode], theme: &Theme) -> impl IntoElement {
+fn meta_dot(theme: &Theme) -> Div {
+    div()
+        .size(px(3.))
+        .flex_shrink_0()
+        .rounded_full()
+        .bg(theme.text_faint)
+}
+
+fn loading_body(label: &'static str, theme: &Theme) -> gpui::AnyElement {
+    div()
+        .flex_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(12.))
+        .text_color(theme.text_dim)
+        .child(label)
+        .into_any_element()
+}
+
+fn page_for_kind(kind: ResourceKind) -> Page {
+    match kind {
+        ResourceKind::Container => Page::Containers,
+        ResourceKind::Image => Page::Images,
+        ResourceKind::Volume => Page::Volumes,
+    }
+}
+
+fn page_icon(page: Page) -> &'static str {
+    match page {
+        Page::Containers => "icons/containers.svg",
+        Page::Images => "icons/images.svg",
+        Page::Volumes => "icons/volumes.svg",
+    }
+}
+
+/// Inspect rendering stays mechanical: one Overview card for top-level
+/// scalars, then one card per top-level group, all in `build_tree` order.
+fn render_inspect_cards(nodes: &[InspectNode], theme: &Theme) -> impl IntoElement {
     let mut container = div()
         .id("inspect-tree")
         .flex_1()
         .min_h(px(0.))
         .overflow_y_scroll()
-        .p_3()
+        .p(px(20.))
         .flex()
         .flex_col()
-        .gap_2();
+        .gap(px(12.));
 
-    for node in nodes {
-        let mut group = div().flex().flex_col().gap_1().child(
-            div()
-                .text_xs()
-                .text_color(theme.text_dim)
-                .child(node.key.clone()),
-        );
-
-        if let Some(value) = node.value.clone() {
-            group = group.child(
-                div()
-                    .text_xs()
-                    .font_family("JetBrains Mono")
-                    .text_color(theme.text)
-                    .child(value),
-            );
-        }
-
-        for child in node.children.iter() {
-            let mut row = div().pl_3().flex().gap_3();
-            row = row.child(
-                div()
-                    .w(px(180.))
-                    .flex_shrink_0()
-                    .truncate()
-                    .text_xs()
-                    .text_color(theme.text_dim)
-                    .child(child.key.clone()),
-            );
-            row = row.child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .truncate()
-                    .text_xs()
-                    .font_family("JetBrains Mono")
-                    .text_color(theme.text)
-                    .child(child.value.clone().unwrap_or_default()),
-            );
-            group = group.child(row);
-        }
-
-        container = container.child(group);
+    let scalars: Vec<&InspectNode> = nodes.iter().filter(|node| node.value.is_some()).collect();
+    if !scalars.is_empty() {
+        container = container.child(inspect_overview_card(&scalars, theme));
+    }
+    for node in nodes.iter().filter(|node| node.value.is_none()) {
+        container = container.child(inspect_card(
+            node.key.as_ref(),
+            &node.children.iter().collect::<Vec<_>>(),
+            theme,
+        ));
     }
 
     container
 }
 
-fn state_label(state: ContainerState) -> &'static str {
-    match state {
-        ContainerState::Running => "running",
-        ContainerState::Paused => "paused",
-        ContainerState::Restarting => "restarting",
-        ContainerState::Exited => "exited",
-        ContainerState::Created => "created",
-        ContainerState::Dead => "dead",
-        ContainerState::Unknown => "unknown",
-    }
+fn inspect_card_shell(title: &str, theme: &Theme) -> Div {
+    div()
+        .rounded(px(10.))
+        .bg(theme.bg)
+        .border_1()
+        .border_color(theme.border_subtle)
+        .overflow_hidden()
+        .child(
+            div()
+                .h(px(36.))
+                .px(px(12.))
+                .flex()
+                .items_center()
+                .text_size(px(11.))
+                .line_height(px(14.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text_dim)
+                .child(title.to_uppercase()),
+        )
 }
 
-fn state_color(state: ContainerState) -> gpui::Rgba {
-    let theme = Theme::dark();
-    match state {
-        ContainerState::Running => theme.running,
-        ContainerState::Paused | ContainerState::Restarting => theme.paused,
-        ContainerState::Dead => theme.error,
-        ContainerState::Exited | ContainerState::Created | ContainerState::Unknown => {
-            theme.exited
+/// Top-level scalars as a two-column key/value grid, in `build_tree` order.
+fn inspect_overview_card(entries: &[&InspectNode], theme: &Theme) -> Div {
+    let mut card = inspect_card_shell("Overview", theme);
+
+    for (index, pair) in entries.chunks(2).enumerate() {
+        let mut row = div()
+            .h(px(32.))
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(24.));
+        if index > 0 {
+            row = row.border_t_1().border_color(theme.border_subtle);
         }
+        for entry in pair {
+            row = row.child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .w(px(120.))
+                            .flex_shrink_0()
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(theme.text_dim)
+                            .child(entry.key.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .font_family("JetBrains Mono")
+                            .text_size(px(12.))
+                            .text_color(theme.text)
+                            .child(entry.value.clone().unwrap_or_default()),
+                    ),
+            );
+        }
+        if pair.len() == 1 {
+            row = row.child(div().flex_1());
+        }
+        card = card.child(row);
     }
+
+    card
+}
+
+fn inspect_card(title: &str, entries: &[&InspectNode], theme: &Theme) -> Div {
+    let mut card = inspect_card_shell(title, theme);
+
+    for (index, entry) in entries.iter().enumerate() {
+        let mut row = div()
+            .h(px(32.))
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(12.));
+        if index > 0 {
+            row = row.border_t_1().border_color(theme.border_subtle);
+        }
+        card = card.child(
+            row.child(
+                div()
+                    .w(px(200.))
+                    .flex_shrink_0()
+                    .truncate()
+                    .text_size(px(11.))
+                    .text_color(theme.text_dim)
+                    .child(entry.key.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .font_family("JetBrains Mono")
+                    .text_size(px(12.))
+                    .text_color(if entry.value.is_some() {
+                        theme.text
+                    } else {
+                        theme.text_dim
+                    })
+                    .child(entry.value.clone().unwrap_or_default()),
+            ),
+        );
+    }
+
+    card
 }
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.activation.is_none() {
-            self.activation =
-                Some(cx.observe_window_activation(window, |this, _window, cx| {
-                    this.refresh_if_stale();
-                    cx.notify();
-                }));
+            self.activation = Some(cx.observe_window_activation(window, |this, _window, cx| {
+                this.refresh_if_stale();
+                cx.notify();
+            }));
         }
         if !self.focus_initialized {
             self.focus_initialized = true;
@@ -2503,13 +3226,15 @@ impl Render for RootView {
         }
 
         let theme = self.theme.clone();
-        let rail = self.render_rail(cx);
+        let layout = Layout::for_viewport(window.viewport_size());
+        let rail = self.render_rail(&layout, cx);
         let menu = self.render_host_menu(cx);
         let content: gpui::AnyElement = if self.detail.is_some() {
-            self.render_detail(cx).into_any_element()
+            self.render_detail(&layout, cx).into_any_element()
         } else {
-            let header = self.render_header(cx);
-            let table = self.render_table(cx);
+            let header = self.render_header(&layout, cx);
+            let overview = self.render_overview(&layout, cx);
+            let table = self.render_table(&layout, cx);
             let mut column = div()
                 .flex_1()
                 .min_w(px(0.))
@@ -2518,33 +3243,47 @@ impl Render for RootView {
                 .flex_col()
                 .child(header);
 
-            if let Some(strip) = self.render_pull_strip() {
+            if let Some(strip) = self.render_pull_strip(&layout) {
                 column = column.child(strip);
             }
 
             if let Some(error) = self.last_error.clone() {
                 column = column.child(
                     div()
-                        .h(px(32.))
-                        .px_4()
+                        .h(px(36.))
+                        .px(px(layout.page_padding))
                         .flex()
                         .items_center()
                         .justify_between()
-                        .gap_3()
-                        .bg(theme.panel)
+                        .gap(px(12.))
+                        .bg(theme.error_soft)
                         .border_b_1()
                         .border_color(theme.error)
-                        .text_xs()
+                        .text_size(px(12.))
                         .text_color(theme.error)
-                        .child(div().truncate().child(error))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    svg()
+                                        .path("icons/alert.svg")
+                                        .size(px(14.))
+                                        .text_color(theme.error),
+                                )
+                                .child(div().truncate().child(error)),
+                        )
                         .child(
                             div()
                                 .id("retry")
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
+                                .px(px(8.))
+                                .h(px(24.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(6.))
                                 .cursor_pointer()
-                                .hover(|s| s.bg(theme.hover))
+                                .hover(|s| s.bg(theme.error_soft))
                                 .on_click(cx.listener(|this, _event, _window, cx| {
                                     this.last_error = None;
                                     this.refresh();
@@ -2555,7 +3294,21 @@ impl Render for RootView {
                 );
             }
 
-            column.child(table).into_any_element()
+            column
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(layout.section_gap))
+                        .px(px(layout.page_padding))
+                        .pt(px(layout.page_padding))
+                        .pb(px(layout.page_padding))
+                        .child(overview)
+                        .child(table),
+                )
+                .into_any_element()
         };
 
         let mut root = div()
@@ -2567,48 +3320,62 @@ impl Render for RootView {
             .text_color(theme.text)
             .track_focus(&self.root_focus)
             .on_key_down(cx.listener(|this, event, window, cx| this.on_root_key(event, window, cx)))
-            .on_action(cx.listener(|this, _: &crate::actions::ShowContainers, _window, cx| {
-                this.switch_page(Page::Containers);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &crate::actions::ShowImages, _window, cx| {
-                this.switch_page(Page::Images);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &crate::actions::ShowVolumes, _window, cx| {
-                this.switch_page(Page::Volumes);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &crate::actions::Refresh, _window, cx| {
-                this.refresh();
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &crate::actions::FocusSearch, window, cx| {
-                window.focus(&this.search_focus);
-                cx.notify();
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ShowContainers, _window, cx| {
+                    this.switch_page(Page::Containers);
+                    cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ShowImages, _window, cx| {
+                    this.switch_page(Page::Images);
+                    cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ShowVolumes, _window, cx| {
+                    this.switch_page(Page::Volumes);
+                    cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::Refresh, _window, cx| {
+                    this.refresh();
+                    cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::FocusSearch, window, cx| {
+                    window.focus(&this.search_focus);
+                    cx.notify();
+                }),
+            )
             .on_action(cx.listener(|this, _: &crate::actions::Back, _window, cx| {
                 this.go_back();
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &crate::actions::RunContainer, window, cx| {
-                if this.mutations.confirm.is_some() || this.mutations.run.is_some() {
-                    return;
-                }
-                this.open_run(None, window, cx);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &crate::actions::PullImage, window, cx| {
-                if this.mutations.confirm.is_some() || this.mutations.run.is_some() {
-                    return;
-                }
-                this.close_detail();
-                this.switch_page(Page::Images);
-                this.mutations.pull_open = true;
-                this.host_menu_open = false;
-                window.focus(&this.pull_focus);
-                cx.notify();
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::RunContainer, window, cx| {
+                    if this.mutations.confirm.is_some() || this.mutations.run.is_some() {
+                        return;
+                    }
+                    this.open_run(None, window, cx);
+                    cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::PullImage, window, cx| {
+                    if this.mutations.confirm.is_some() || this.mutations.run.is_some() {
+                        return;
+                    }
+                    this.close_detail();
+                    this.switch_page(Page::Images);
+                    this.mutations.pull_open = true;
+                    this.host_menu_open = false;
+                    window.focus(&this.pull_focus);
+                    cx.notify();
+                }),
+            )
             .on_action(cx.listener(|_, _: &crate::actions::Quit, _window, cx| {
                 cx.quit();
             }));
@@ -2701,9 +3468,9 @@ mod tests {
             RootView::volumes_table(&snapshot).spec.actions,
             Some(ActionsColumn::Volume)
         );
-        assert_eq!(ActionsColumn::Container.width(), 124.0);
-        assert_eq!(ActionsColumn::Image.width(), 84.0);
-        assert_eq!(ActionsColumn::Volume.width(), 44.0);
+        assert_eq!(ActionsColumn::Container.width(), 132.0);
+        assert_eq!(ActionsColumn::Image.width(), 92.0);
+        assert_eq!(ActionsColumn::Volume.width(), 52.0);
     }
 
     #[test]

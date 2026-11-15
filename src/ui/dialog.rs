@@ -1,12 +1,12 @@
 use crate::docker::actions::{Proto, RunField};
 use crate::docker::model::ResourceKind;
 use crate::theme::Theme;
-use crate::ui::mutations::{confirm_copy, ConfirmState, RunState};
+use crate::ui::mutations::{ConfirmState, RunState, confirm_copy};
 use crate::ui::root::RootView;
 use crate::ui::widgets::text_input;
 use gpui::prelude::*;
 use gpui::{
-    div, px, svg, AnyElement, Context, FocusHandle, KeyDownEvent, MouseButton, SharedString, Window,
+    AnyElement, Context, FocusHandle, KeyDownEvent, MouseButton, SharedString, Window, div, px, svg,
 };
 
 pub fn confirm(confirm: &ConfirmState, theme: &Theme, cx: &mut Context<RootView>) -> AnyElement {
@@ -26,19 +26,52 @@ pub fn confirm(confirm: &ConfirmState, theme: &Theme, cx: &mut Context<RootView>
         );
 
     let mut panel = div()
-        .w(px(440.))
-        .p_4()
+        .w(px(460.))
+        .p(px(20.))
         .occlude()
         .flex()
         .flex_col()
-        .gap_3()
-        .rounded_lg()
+        .gap(px(16.))
+        .rounded(px(14.))
         .bg(theme.panel)
         .border_1()
         .border_color(theme.border)
         .shadow_lg()
-        .child(div().text_base().child(title))
-        .child(div().text_sm().text_color(theme.text_dim).child(body));
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .size(px(32.))
+                        .rounded(px(8.))
+                        .bg(theme.error_soft)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            svg()
+                                .path("icons/trash.svg")
+                                .size(px(16.))
+                                .text_color(theme.error),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(16.))
+                        .line_height(px(20.))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(title),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(13.))
+                .line_height(px(19.))
+                .text_color(theme.text_dim)
+                .child(body),
+        );
 
     if confirm.kind != ResourceKind::Volume {
         let (label, hint) = match confirm.kind {
@@ -57,9 +90,14 @@ pub fn confirm(confirm: &ConfirmState, theme: &Theme, cx: &mut Context<RootView>
         panel = panel.child(
             div()
                 .id("confirm-force")
+                .p(px(12.))
+                .rounded(px(10.))
+                .bg(theme.bg)
+                .border_1()
+                .border_color(theme.border_subtle)
                 .flex()
                 .items_start()
-                .gap_2()
+                .gap(px(8.))
                 .cursor_pointer()
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     if let Some(confirm) = &mut this.mutations.confirm {
@@ -71,42 +109,63 @@ pub fn confirm(confirm: &ConfirmState, theme: &Theme, cx: &mut Context<RootView>
                     div()
                         .mt(px(1.))
                         .size(px(14.))
-                        .rounded_sm()
+                        .rounded(px(4.))
                         .border_1()
                         .border_color(box_color)
                         .bg(box_color)
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_xs()
-                        .text_color(check_color)
-                        .child(if checked { "✓" } else { "" }),
+                        .when(checked, |this| {
+                            this.child(
+                                svg()
+                                    .path("icons/check.svg")
+                                    .size(px(10.))
+                                    .text_color(check_color),
+                            )
+                        }),
                 )
                 .child(
                     div()
                         .flex()
                         .flex_col()
-                        .gap_1()
-                        .child(div().text_sm().child(label))
-                        .child(div().text_xs().text_color(theme.text_dim).child(hint)),
+                        .gap(px(2.))
+                        .child(div().text_size(px(13.)).text_color(theme.text).child(label))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.text_dim)
+                                .child(hint),
+                        ),
                 ),
         );
     }
 
     if let Some(error) = &confirm.error {
-        panel = panel.child(div().text_xs().text_color(theme.error).child(error.clone()));
+        panel = panel.child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme.error)
+                .child(error.clone()),
+        );
     }
 
     let submitting = confirm.submitting;
-    let cancel_color = if submitting { theme.text_dim } else { theme.text };
+    let cancel_color = if submitting {
+        theme.text_dim
+    } else {
+        theme.text
+    };
     let mut cancel = div()
         .id("confirm-cancel")
-        .px_3()
-        .py_1()
-        .rounded_md()
+        .h(px(32.))
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .rounded(px(10.))
         .border_1()
         .border_color(theme.border)
-        .text_sm()
+        .text_size(px(12.))
         .text_color(cancel_color)
         .child("Cancel");
     if !submitting {
@@ -122,17 +181,29 @@ pub fn confirm(confirm: &ConfirmState, theme: &Theme, cx: &mut Context<RootView>
     let remove_label = if submitting { "Removing…" } else { "Remove" };
     let mut remove = div()
         .id("confirm-remove")
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .bg(if submitting { theme.border } else { theme.error })
-        .text_sm()
-        .text_color(theme.bg)
+        .h(px(32.))
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .rounded(px(10.))
+        .border_1()
+        .border_color(theme.error_soft)
+        .bg(if submitting {
+            theme.border
+        } else {
+            theme.panel
+        })
+        .text_size(px(12.))
+        .text_color(if submitting {
+            theme.text_dim
+        } else {
+            theme.error
+        })
         .child(remove_label);
     if !submitting {
         remove = remove
             .cursor_pointer()
-            .hover(|s| s.opacity(0.9))
+            .hover(|s| s.bg(theme.error_soft))
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.submit_confirm();
                 cx.notify();
@@ -160,9 +231,8 @@ pub fn confirm(confirm: &ConfirmState, theme: &Theme, cx: &mut Context<RootView>
 }
 
 pub fn menu_separator(theme: &Theme) -> gpui::Div {
-    div().h(px(1.)).my_1().bg(theme.border)
+    div().h(px(1.)).my(px(4.)).bg(theme.border_subtle)
 }
-
 
 pub fn pull_popover(
     reference: &str,
@@ -188,26 +258,30 @@ pub fn pull_popover(
         true,
         theme,
     )
-    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
-        if event.keystroke.key == "enter" {
-            let reference = this.mutations.pull_input.clone();
-            this.start_pull(&reference, PullOrigin::Header);
-            cx.notify();
-            return;
-        }
-        if text_input::edit_text(&mut this.mutations.pull_input, event, cx) {
-            this.mutations.pull_error = None;
-            cx.notify();
-        }
-    }));
+    .on_key_down(
+        cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
+            if event.keystroke.key == "enter" {
+                let reference = this.mutations.pull_input.clone();
+                this.start_pull(&reference, PullOrigin::Header);
+                cx.notify();
+                return;
+            }
+            if text_input::edit_text(&mut this.mutations.pull_input, event, cx) {
+                this.mutations.pull_error = None;
+                cx.notify();
+            }
+        }),
+    );
 
     let mut submit = div()
         .id("pull-submit")
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .text_sm()
-        .text_color(if can_pull { theme.bg } else { theme.text_dim })
+        .h(px(32.))
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .rounded(px(10.))
+        .text_size(px(12.))
+        .text_color(if can_pull { theme.text } else { theme.text_dim })
         .bg(if can_pull { theme.accent } else { theme.border })
         .child(if pulling { "Pulling…" } else { "Pull" });
     if can_pull {
@@ -223,35 +297,52 @@ pub fn pull_popover(
 
     let mut panel = div()
         .absolute()
-        .top(px(60.))
+        .top(px(68.))
         .right(px(16.))
         .w(px(360.))
-        .p_3()
+        .p(px(16.))
         .occlude()
         .flex()
         .flex_col()
-        .gap_2()
-        .rounded_md()
+        .gap(px(10.))
+        .rounded(px(14.))
         .bg(theme.panel)
         .border_1()
         .border_color(theme.border)
         .shadow_lg()
         .child(
             div()
-                .text_xs()
-                .text_color(theme.text_dim)
-                .child("Pull an image from the registry"),
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.text)
+                        .child("Pull image"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.text_dim)
+                        .child("Download an image from the registry"),
+                ),
         )
         .child(input);
 
     if let Some(error) = error {
-        panel = panel.child(div().text_xs().text_color(theme.error).child(error.to_string()));
+        panel = panel.child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme.error)
+                .child(error.to_string()),
+        );
     }
     panel = panel.child(div().flex().justify_end().child(submit));
 
     panel.into_any_element()
 }
-
 
 #[derive(Clone)]
 pub struct RunFocus {
@@ -404,7 +495,13 @@ fn labeled(
         .flex()
         .flex_col()
         .gap_1()
-        .child(div().text_xs().text_color(theme.text_dim).child(label))
+        .child(
+            div()
+                .text_size(px(10.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text_dim)
+                .child(label.to_uppercase()),
+        )
         .child(input_field(
             field,
             text,
@@ -418,7 +515,12 @@ fn labeled(
             cx,
         ));
     if let Some(message) = error {
-        column = column.child(div().text_xs().text_color(theme.error).child(message));
+        column = column.child(
+            div()
+                .text_size(px(11.))
+                .text_color(theme.error)
+                .child(message),
+        );
     }
     column
 }
@@ -433,22 +535,38 @@ fn section_header(
 ) -> gpui::Div {
     let mut add = div()
         .id(SharedString::from(format!("add-{add_label}")))
-        .text_xs()
+        .h(px(24.))
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .rounded(px(6.))
+        .text_size(px(11.))
         .child(add_label)
-        .text_color(if disabled { theme.text_dim } else { theme.accent });
+        .text_color(if disabled {
+            theme.text_dim
+        } else {
+            theme.accent
+        });
     if !disabled {
-        add = add.cursor_pointer().on_click(cx.listener(
-            move |this, _event, _window, cx| {
+        add = add
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.accent_soft))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
                 on_add(this, cx);
                 cx.notify();
-            },
-        ));
+            }));
     }
     div()
         .flex()
         .items_center()
         .justify_between()
-        .child(div().text_xs().text_color(theme.text_dim).child(title))
+        .child(
+            div()
+                .text_size(px(10.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text_dim)
+                .child(title.to_uppercase()),
+        )
         .child(add)
 }
 
@@ -463,14 +581,24 @@ fn toggle(
 ) -> gpui::Stateful<gpui::Div> {
     let mut toggle = div()
         .id(SharedString::from(id))
-        .px_2()
-        .h(px(28.))
+        .px(px(10.))
+        .h(px(30.))
         .flex()
         .items_center()
-        .rounded_md()
+        .rounded(px(8.))
         .border_1()
-        .border_color(if selected { theme.accent } else { theme.border })
-        .text_xs()
+        .border_color(if selected {
+            theme.accent
+        } else {
+            theme.border_subtle
+        })
+        .bg(if selected {
+            theme.accent_soft
+        } else {
+            theme.bg
+        })
+        .text_size(px(11.))
+        .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(if selected && !disabled {
             theme.text
         } else {
@@ -480,6 +608,7 @@ fn toggle(
     if !disabled {
         toggle = toggle
             .cursor_pointer()
+            .hover(|style| style.bg(theme.hover))
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 on_click(this);
                 cx.notify();
@@ -497,12 +626,17 @@ fn remove_button(
 ) -> gpui::Stateful<gpui::Div> {
     let mut button = div()
         .id(SharedString::from(id))
-        .size(px(22.))
+        .size(px(24.))
         .flex()
         .items_center()
         .justify_center()
-        .rounded_sm()
-        .child(svg().path("icons/close.svg").size(px(12.)).text_color(theme.text_dim));
+        .rounded(px(6.))
+        .child(
+            svg()
+                .path("icons/close.svg")
+                .size(px(13.))
+                .text_color(theme.text_dim),
+        );
     if !disabled {
         button = button
             .cursor_pointer()
@@ -545,10 +679,10 @@ pub fn run_dialog(
         .flex_1()
         .min_h(px(0.))
         .overflow_y_scroll()
-        .p_4()
+        .p(px(20.))
         .flex()
         .flex_col()
-        .gap_4();
+        .gap(px(20.));
 
     body = body
         .child(labeled(
@@ -661,7 +795,12 @@ pub fn run_dialog(
         if let Some(message) = field_error(run, RunField::PortHost(index))
             .or_else(|| field_error(run, RunField::PortContainer(index)))
         {
-            row = row.child(div().text_xs().text_color(theme.error).child(message));
+            row = row.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.error)
+                    .child(message),
+            );
         }
         body = body.child(row);
     }
@@ -715,7 +854,12 @@ pub fn run_dialog(
                 move |this| this.remove_run_env(index),
             ));
         if let Some(message) = field_error(run, RunField::EnvKey(index)) {
-            row = row.child(div().text_xs().text_color(theme.error).child(message));
+            row = row.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.error)
+                    .child(message),
+            );
         }
         body = body.child(row);
     }
@@ -780,19 +924,24 @@ pub fn run_dialog(
         if let Some(message) = field_error(run, RunField::MountSource(index))
             .or_else(|| field_error(run, RunField::MountTarget(index)))
         {
-            row = row.child(div().text_xs().text_color(theme.error).child(message));
+            row = row.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.error)
+                    .child(message),
+            );
         }
         body = body.child(row);
     }
 
     let mut footer = div()
-        .px_4()
-        .py_3()
+        .px(px(20.))
+        .py(px(16.))
         .border_t_1()
-        .border_color(theme.border)
+        .border_color(theme.border_subtle)
         .flex()
         .items_center()
-        .gap_3();
+        .gap(px(12.));
 
     if let Some(error) = &run.daemon_error {
         let mut block = div()
@@ -800,22 +949,38 @@ pub fn run_dialog(
             .min_w(px(0.))
             .flex()
             .flex_col()
-            .gap_1()
-            .child(div().text_xs().text_color(theme.error).child(error.clone()));
+            .gap(px(4.))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.error)
+                    .child(error.clone()),
+            );
         if run.missing_image {
             let can_pull = !pulling;
             let mut pull = div()
                 .id("run-pull-it")
-                .text_xs()
-                .text_color(if can_pull { theme.accent } else { theme.text_dim })
+                .h(px(24.))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                .text_size(px(11.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(if can_pull {
+                    theme.accent
+                } else {
+                    theme.text_dim
+                })
                 .child(if pulling { "Pulling…" } else { "Pull it" });
             if can_pull {
-                pull = pull.cursor_pointer().on_click(cx.listener(
-                    |this, _event, _window, cx| {
+                pull = pull
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.accent_soft))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
                         this.pull_run_image();
                         cx.notify();
-                    },
-                ));
+                    }));
             }
             block = block.child(pull);
         }
@@ -826,13 +991,19 @@ pub fn run_dialog(
 
     let mut cancel = div()
         .id("run-cancel")
-        .px_3()
-        .py_1()
-        .rounded_md()
+        .h(px(32.))
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .rounded(px(10.))
         .border_1()
         .border_color(theme.border)
-        .text_sm()
-        .text_color(if submitting { theme.text_dim } else { theme.text })
+        .text_size(px(12.))
+        .text_color(if submitting {
+            theme.text_dim
+        } else {
+            theme.text
+        })
         .child("Cancel");
     if !submitting {
         cancel = cancel
@@ -847,12 +1018,15 @@ pub fn run_dialog(
     let can_run = !run.form.image.trim().is_empty() && !frozen;
     let mut run_button = div()
         .id("run-submit")
-        .px_3()
-        .py_1()
-        .rounded_md()
+        .h(px(32.))
+        .px(px(14.))
+        .flex()
+        .items_center()
+        .rounded(px(10.))
         .bg(if can_run { theme.accent } else { theme.border })
-        .text_sm()
-        .text_color(if can_run { theme.bg } else { theme.text_dim })
+        .text_size(px(12.))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(if can_run { theme.text } else { theme.text_dim })
         .child(if submitting { "Running…" } else { "Run" });
     if can_run {
         run_button = run_button
@@ -867,12 +1041,17 @@ pub fn run_dialog(
 
     let mut close = div()
         .id("run-close")
-        .size(px(24.))
+        .size(px(28.))
         .flex()
         .items_center()
         .justify_center()
-        .rounded_md()
-        .child(svg().path("icons/close.svg").size(px(12.)).text_color(theme.text_dim));
+        .rounded(px(8.))
+        .child(
+            svg()
+                .path("icons/close.svg")
+                .size(px(14.))
+                .text_color(theme.text_dim),
+        );
     if !submitting {
         close = close
             .cursor_pointer()
@@ -884,23 +1063,30 @@ pub fn run_dialog(
     }
 
     let header = div()
-        .px_4()
-        .py_3()
+        .px(px(20.))
+        .h(px(60.))
+        .flex_shrink_0()
         .border_b_1()
-        .border_color(theme.border)
+        .border_color(theme.border_subtle)
         .flex()
         .items_center()
         .justify_between()
-        .child(div().text_base().child("Run a container"))
+        .child(
+            div()
+                .text_size(px(16.))
+                .line_height(px(20.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child("Run a container"),
+        )
         .child(close);
 
     let panel = div()
-        .w(px(640.))
-        .max_h(px(560.))
+        .w(px(680.))
+        .max_h(px(600.))
         .occlude()
         .flex()
         .flex_col()
-        .rounded_lg()
+        .rounded(px(14.))
         .bg(theme.panel)
         .border_1()
         .border_color(theme.border)
