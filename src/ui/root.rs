@@ -2,7 +2,9 @@ use crate::docker::actions::{
     ActionKind, ContainerAction, Proto, RunField, RunForm, Target, build_run_spec,
 };
 use crate::docker::endpoint::{HostInfo, HostStatus, discover};
-use crate::docker::model::{ContainerState, ResourceKind, Snapshot};
+use crate::docker::model::{
+    ContainerRow, ContainerState, ContainerStats, ResourceKind, Snapshot,
+};
 use crate::docker::service::{DockerService, PullOrigin, Request, Response};
 use crate::theme::Theme;
 use crate::ui::detail::DetailState;
@@ -119,12 +121,42 @@ fn reset_host_data(
     *detail = None;
 }
 
+/// The set of containers whose stats the UI can currently show. Compose
+/// collapse and the search query deliberately do not prune this: the list
+/// page keeps every running container's stream alive, like Docker Desktop.
+fn stats_targets_for(
+    page: Page,
+    detail: Option<&DetailState>,
+    containers: &[ContainerRow],
+) -> HashSet<String> {
+    if page != Page::Containers {
+        return HashSet::new();
+    }
+    if let Some(detail) = detail {
+        if detail.kind != ResourceKind::Container {
+            return HashSet::new();
+        }
+        return containers
+            .iter()
+            .filter(|c| c.id == detail.id && c.state == ContainerState::Running)
+            .map(|c| c.id.clone())
+            .collect();
+    }
+    containers
+        .iter()
+        .filter(|c| c.state == ContainerState::Running)
+        .map(|c| c.id.clone())
+        .collect()
+}
+
 pub struct RootView {
     pub page: Page,
     pub theme: Theme,
     pub service: Option<DockerService>,
     pub snapshot: Snapshot,
     pub stats: OverviewStats,
+    pub container_stats: HashMap<String, ContainerStats>,
+    watched_stats: HashSet<String>,
     pub status: HostStatus,
     pub hosts: Vec<HostInfo>,
     pub active_host: Option<String>,
@@ -160,6 +192,8 @@ impl RootView {
             service: None,
             snapshot: Snapshot::empty(),
             stats: OverviewStats::default(),
+            container_stats: HashMap::new(),
+            watched_stats: HashSet::new(),
             status: HostStatus::Unknown,
             hosts: discovery.hosts,
             active_host: discovery.active,
@@ -199,6 +233,8 @@ impl RootView {
         self._pump = None;
         self.host_menu_open = false;
         reset_host_data(&mut self.snapshot, &mut self.tables, &mut self.detail);
+        self.container_stats.clear();
+        self.watched_stats.clear();
         self.mutations = Mutations::new();
         self.run_focus = None;
         self.last_error = None;
@@ -241,6 +277,14 @@ impl RootView {
             Response::Snapshot(snapshot) => {
                 self.stats = OverviewStats::from_snapshot(&snapshot);
                 self.snapshot = snapshot;
+                let running: HashSet<String> = self
+                    .snapshot
+                    .containers
+                    .iter()
+                    .filter(|container| container.state == ContainerState::Running)
+                    .map(|container| container.id.clone())
+                    .collect();
+                self.container_stats.retain(|id, _| running.contains(id));
                 self.rebuild_tables();
                 self.last_error = None;
                 if let Some(id) = self.mutations.pending_select.take() {
@@ -273,6 +317,7 @@ impl RootView {
                         detail.missing = true;
                     }
                 }
+                self.sync_stats_targets();
             }
             Response::Status(status) => {
                 let had_work = self.mutations.has_in_flight();
@@ -420,14 +465,43 @@ impl RootView {
                         .apply_run_failed(message, missing_image, created, epoch);
                 self.apply_run_outcome(outcome);
             }
-            // Wired up in the next task; keeps this commit compiling.
-            Response::Stats { .. } => {}
+            Response::Stats { id, stats } => {
+                if self.watched_stats.contains(&id) {
+                    self.container_stats.insert(id, stats);
+                    if self.page == Page::Containers {
+                        let rows = crate::ui::tables::containers_table(
+                            &self.snapshot,
+                            &self.container_stats,
+                        )
+                        .rows;
+                        self.tables[Page::Containers.index()].replace_rows(rows);
+                    }
+                }
+            }
         }
     }
 
     fn rebuild_tables(&mut self) {
         self.tables =
-            crate::ui::tables::tables_from(&self.snapshot, &HashMap::new(), &self.tables);
+            crate::ui::tables::tables_from(&self.snapshot, &self.container_stats, &self.tables);
+    }
+
+    /// Aligns the service's stats streams with what the page and detail show,
+    /// and drops readings that are no longer watched.
+    fn sync_stats_targets(&mut self) {
+        let targets = stats_targets_for(self.page, self.detail.as_ref(), &self.snapshot.containers);
+        self.watched_stats = targets.clone();
+        self.container_stats.retain(|id, _| targets.contains(id));
+        if self.page == Page::Containers {
+            let rows =
+                crate::ui::tables::containers_table(&self.snapshot, &self.container_stats).rows;
+            self.tables[Page::Containers.index()].replace_rows(rows);
+        }
+        if let Some(service) = &self.service {
+            service.request(Request::WatchStats {
+                ids: targets.into_iter().collect(),
+            });
+        }
     }
 
     pub fn switch_page(&mut self, page: Page) {
@@ -436,6 +510,7 @@ impl RootView {
         self.host_menu_open = false;
         self.mutations.pull_open = false;
         self.refresh_if_stale();
+        self.sync_stats_targets();
     }
 
     /// The containers list as displayed: Compose project headers with their
@@ -766,10 +841,12 @@ impl RootView {
         if let Some(service) = &self.service {
             service.request(Request::Inspect { kind, id });
         }
+        self.sync_stats_targets();
     }
 
     fn close_detail(&mut self) {
         self.detail = None;
+        self.sync_stats_targets();
     }
 
     fn open_detail_by_id(&mut self, kind: ResourceKind, id: &str) {
@@ -1187,5 +1264,31 @@ mod tests {
         assert!(tables[0].rows.is_empty());
         assert_eq!(tables[0].query, "");
         assert!(detail.is_none());
+    }
+
+    #[test]
+    fn stats_targets_follow_page_and_detail() {
+        let containers = vec![
+            container("web", ContainerState::Running),
+            container("db", ContainerState::Running),
+            container("job", ContainerState::Exited),
+        ];
+        assert!(stats_targets_for(Page::Images, None, &containers).is_empty());
+        assert_eq!(
+            stats_targets_for(Page::Containers, None, &containers),
+            HashSet::from(["web-id".to_string(), "db-id".to_string()])
+        );
+
+        let web = DetailState::new(ResourceKind::Container, "web-id".into(), "web".into());
+        assert_eq!(
+            stats_targets_for(Page::Containers, Some(&web), &containers),
+            HashSet::from(["web-id".to_string()])
+        );
+
+        let stopped = DetailState::new(ResourceKind::Container, "job-id".into(), "job".into());
+        assert!(stats_targets_for(Page::Containers, Some(&stopped), &containers).is_empty());
+
+        let image = DetailState::new(ResourceKind::Image, "web-id".into(), "web".into());
+        assert!(stats_targets_for(Page::Containers, Some(&image), &containers).is_empty());
     }
 }
