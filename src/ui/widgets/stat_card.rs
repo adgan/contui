@@ -4,6 +4,14 @@ use crate::ui::style::Layout;
 use gpui::prelude::*;
 use gpui::{Context, FontWeight, Stateful, div, px, relative, svg};
 
+/// The bottom edge of a rounded card is only straight from the corner radius
+/// inwards. GPUI 0.2.2 masks content with rectangles, so an absolutely
+/// positioned child that reaches the bottom corners is painted outside the
+/// rounded outline. Keep the progress bar inside the straight section.
+fn progress_bar_inset(padding: f32) -> f32 {
+    padding.max(radius::LG)
+}
+
 pub struct StatCard<'a> {
     pub id: &'static str,
     pub kicker: &'a str,
@@ -148,11 +156,12 @@ pub fn stat_card(
 
     if let Some(progress) = card.progress {
         let fraction = progress.clamp(0.0, 1.0);
+        let bar_inset = progress_bar_inset(padding);
         element = element.child(
             div()
                 .absolute()
-                .left_0()
-                .right_0()
+                .left(px(bar_inset))
+                .right(px(bar_inset))
                 .bottom_0()
                 .h(px(3.))
                 .bg(theme.border_subtle)
@@ -170,4 +179,23 @@ pub fn stat_card(
     }
 
     element
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_bar_starts_inside_the_straight_bottom_edge() {
+        // A bar pinned at the bottom edge that starts nearer than the corner
+        // radius lands in the rounded corner cut-out, which GPUI 0.2.2 paints
+        // because its content masks are rectangles. This was the visible
+        // green wedge outside the card.
+        for padding in [10.0_f32, 16.0] {
+            assert!(
+                progress_bar_inset(padding) >= radius::LG,
+                "padding {padding} leaves the bar in the corner arc"
+            );
+        }
+    }
 }
