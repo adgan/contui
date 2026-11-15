@@ -32,10 +32,10 @@ Containers, images and volumes are no longer read-only:
 
 ## Install with Homebrew
 
-A public tap carries the app: `brew install --HEAD adgan/tap/contui`. The
-[tap README](https://github.com/adgan/homebrew-tap) covers trust, launch, upgrade and
-uninstall. It is a source build until the first tagged release, so it needs Rust and the
-Xcode Command Line Tools.
+A public tap carries the app: `brew install adgan/tap/contui`. It installs a prebuilt
+bottle for arm64 macOS 26 (Tahoe) — no Rust, no compile. `brew install --HEAD` builds from
+source for development. The [tap README](https://github.com/adgan/homebrew-tap) covers
+trust, launch, upgrade and uninstall.
 
 ## Build and run
 

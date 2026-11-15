@@ -35,11 +35,19 @@ out="$(scripts/generate-formula.sh 0.1.0 "https://example.test/contui-0.1.0.tar.
 printf '%s\n' "$out" | ruby -c > /dev/null
 printf '%s\n' "$out" | grep -qx '  url "https://example.test/contui-0.1.0.tar.gz"'
 printf '%s\n' "$out" | grep -qx "  sha256 \"$sha\""
-printf '%s\n' "$out" | grep -qx '  version "0.1.0"'
 printf '%s\n' "$out" | grep -qx '  head "https://github.com/adgan/contui.git", branch: "main"'
 printf '%s\n' "$out" | grep -qx '  depends_on macos: :tahoe'
 printf '%s\n' "$out" | grep -qx '  depends_on arch: :arm64'
 ! printf '%s\n' "$out" | grep -q 'bottle do'
 ! printf '%s\n' "$out" | grep -q 'deadbeef'
+# `brew audit --strict` rejects a version that only repeats the URL, and the url must
+# come before where `version` used to be. Both come out of the generator.
+! printf '%s\n' "$out" | grep -q 'version "'
+printf '%s\n' "$out" | grep -n 'url "' | cut -d: -f1 | head -1 | grep -qx 4
+
+# Idempotent: regenerating from an already-generated formula gives the same bytes.
+printf '%s\n' "$out" > "$tmp/generated.rb"
+again="$(scripts/generate-formula.sh 0.1.0 "https://example.test/contui-0.1.0.tar.gz" "$sha" "$tmp/generated.rb")"
+[ "$out" = "$again" ]
 
 echo "generate_formula_test: ok"
