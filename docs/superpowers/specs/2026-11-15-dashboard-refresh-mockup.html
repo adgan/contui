@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --bg:#0b0d10; --rail:#0e1116; --panel:#12151a; --raised:#171c24;
+    --hover:#1a1f27; --selected:#1f2937; --border:#232a34; --border-subtle:#1a2028;
+    --text:#e6e9ef; --dim:#8b93a1; --faint:#5b6472;
+    --accent:#2f7bf6; --accent-soft:#16243c;
+    --running:#3fb950; --running-soft:#12281a;
+    --paused:#d29922; --paused-soft:#2b2412;
+    --exited:#6e7681; --exited-soft:#1d222a;
+    --error:#f85149; --error-soft:#2d1718;
+    --mono:"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:transparent}
+  body{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text)}
+  .stack{display:flex;flex-direction:column;gap:22px;width:728px}
+  .scale{width:960px;zoom:.758}
+  .window{background:var(--bg);border:1px solid #2a323d;border-radius:14px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.45)}
+  .titlebar{height:34px;background:var(--rail);border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;justify-content:center;position:relative}
+  .lights{position:absolute;left:14px;top:11px;display:flex;gap:7px}
+  .light{width:11px;height:11px;border-radius:50%}
+  .light.r{background:#ff5f57}.light.y{background:#febc2e}.light.g{background:#28c840}
+  .window-title{font-size:11px;color:var(--faint);letter-spacing:.02em}
+  .app{display:flex;height:726px;background:var(--bg)}
+  .app.detail-app{height:780px}
+  .rail{width:76px;flex:0 0 76px;background:var(--rail);border-right:1px solid var(--border-subtle);display:flex;flex-direction:column;align-items:center;padding:20px 0 16px}
+  .logo{width:34px;height:34px;border-radius:10px;background:var(--accent-soft);display:flex;align-items:center;justify-content:center;color:var(--accent);margin-bottom:26px}
+  .nav{display:flex;flex-direction:column;gap:8px;width:100%;align-items:center}
+  .nav-item{width:60px;height:54px;border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;color:var(--dim);position:relative;cursor:default}
+  .nav-item svg{width:20px;height:20px}
+  .nav-item span{font-size:9px;font-weight:600;letter-spacing:.07em;text-transform:uppercase}
+  .nav-item.selected{background:var(--selected);color:var(--text)}
+  .nav-item.selected svg{color:var(--accent)}
+  .nav-item.selected::before{content:"";position:absolute;left:-8px;top:13px;bottom:13px;width:3px;border-radius:0 3px 3px 0;background:var(--accent)}
+  .rail-bottom{margin-top:auto;display:flex;flex-direction:column;align-items:center;gap:6px;color:var(--faint)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--running)}
+  .rail-bottom span{font-size:8px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
+  .main{flex:1;min-width:0;display:flex;flex-direction:column}
+  .topbar{height:64px;flex:0 0 64px;padding:0 24px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;justify-content:space-between;gap:18px}
+  .page-title{font-size:18px;font-weight:600;letter-spacing:-.01em;line-height:1.15}
+  .page-sub{font-size:11px;color:var(--dim);margin-top:3px}
+  .top-actions{display:flex;align-items:center;gap:8px;min-width:0}
+  .btn{height:32px;border-radius:10px;display:flex;align-items:center;justify-content:center;gap:6px;font-size:12px;font-weight:500;padding:0 12px;white-space:nowrap}
+  .btn svg{width:14px;height:14px}
+  .btn-primary{background:var(--accent);color:#fff;box-shadow:0 1px 0 rgba(255,255,255,.14) inset}
+  .btn-ghost{color:var(--text);border:1px solid var(--border);background:transparent}
+  .btn-ghost.disabled{color:var(--faint);border-color:var(--border-subtle)}
+  .icon-btn{width:32px;height:32px;border-radius:10px;display:flex;align-items:center;justify-content:center;color:var(--dim)}
+  .icon-btn svg{width:15px;height:15px}
+  .search{width:260px;height:32px;border:1px solid var(--border);border-radius:10px;background:var(--bg);display:flex;align-items:center;gap:8px;padding:0 10px;color:var(--faint);font-size:12px}
+  .search svg{width:14px;height:14px;flex:0 0 auto}
+  .search .hint{margin-left:auto;font-size:9px;font-weight:600;letter-spacing:.04em;border:1px solid var(--border);border-radius:5px;padding:2px 5px;color:var(--faint)}
+  .host{height:32px;border:1px solid var(--border);border-radius:10px;background:var(--bg);display:flex;align-items:center;gap:7px;padding:0 10px;font-size:12px;color:var(--text)}
+  .host svg{width:12px;height:12px;color:var(--faint)}
+  .page{flex:1;min-height:0;padding:24px;display:flex;flex-direction:column;gap:20px}
+  .overview{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;flex:0 0 88px}
+  .stat{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:11px 16px 10px;display:flex;flex-direction:column;position:relative;overflow:hidden}
+  .stat.active{border-color:#345b93;background:var(--panel)}
+  .stat.active::before{content:"";position:absolute;left:16px;top:0;width:34px;height:2px;border-radius:0 0 2px 2px;background:var(--accent)}
+  .stat-head{display:flex;align-items:center;justify-content:space-between;color:var(--dim)}
+  .stat-head svg{width:14px;height:14px}
+  .kicker{font-size:10px;font-weight:600;letter-spacing:.09em;text-transform:uppercase}
+  .stat-value{display:flex;align-items:baseline;gap:7px;margin-top:4px;line-height:1}
+  .stat-value b{font-size:28px;font-weight:600;letter-spacing:-.02em}
+  .stat-value em{font-style:normal;font-size:11px;color:var(--dim)}
+  .stat-value .of{margin-left:auto;font-size:10px;color:var(--faint)}
+  .stat-foot{font-size:10px;color:var(--faint);margin-top:auto;display:flex;align-items:center;gap:6px}
+  .bar{height:4px;border-radius:99px;background:var(--border);overflow:hidden;margin-top:6px}
+  .bar i{display:block;height:100%;width:18.75%;background:var(--running);border-radius:99px}
+  .tablecard{flex:1;min-height:0;background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}
+  .thead,.row{display:grid;grid-template-columns:minmax(0,2.2fr) 104px minmax(0,2fr) 132px 100px 132px;align-items:center;padding:0 20px}
+  .thead{height:40px;flex:0 0 40px;border-bottom:1px solid var(--border-subtle);color:var(--dim)}
+  .thead span{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
+  .thead span.arrow{color:var(--accent)}
+  .tbody{flex:1;min-height:0;overflow:hidden}
+  .row{height:44px;border-bottom:1px solid var(--border-subtle);position:relative;font-size:13px}
+  .row:hover{background:var(--hover)}
+  .row.selected{background:var(--selected)}
+  .row.selected::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent)}
+  .name{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:12px}
+  .mono{font-family:var(--mono);font-size:11.5px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:12px}
+  .time{font-size:11px;color:var(--dim)}
+  .pill{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 8px;border-radius:99px;font-size:10.5px;font-weight:500;width:max-content}
+  .pill i{width:6px;height:6px;border-radius:50%;background:currentColor;display:block}
+  .pill.running{color:var(--running);background:var(--running-soft)}
+  .pill.exited{color:var(--exited);background:var(--exited-soft)}
+  .pill.paused{color:var(--paused);background:var(--paused-soft)}
+  .actions{display:flex;align-items:center;justify-content:flex-end;gap:2px;opacity:.32}
+  .row:hover .actions,.row.selected .actions{opacity:1}
+  .act{width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--dim)}
+  .row.selected .act,.row:hover .act{color:var(--text)}
+  .act svg{width:14px;height:14px}
+  .act.danger{color:var(--error)}
+  .act.run{color:var(--text)}
+  /* detail */
+  .topbar.detail{height:60px;flex-basis:60px}
+  .crumb{display:flex;align-items:center;gap:10px;min-width:0}
+  .back{width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--dim)}
+  .back svg{width:15px;height:15px}
+  .crumb-title{font-size:14px;font-weight:600;white-space:nowrap}
+  .detail-actions{display:flex;align-items:center;gap:4px;margin-left:auto;padding-left:20px}
+  .detail-actions .btn{height:32px;font-size:12px}
+  .btn-danger{color:var(--error);border:1px solid rgba(248,81,73,.28);background:transparent}
+  .page.detail{padding-top:20px;gap:14px}
+  .hero{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px 20px;display:flex;align-items:center;gap:14px;flex:0 0 auto}
+  .hero-icon{width:44px;height:44px;border-radius:12px;background:var(--raised);border:1px solid var(--border-subtle);display:flex;align-items:center;justify-content:center;color:var(--accent);flex:0 0 auto}
+  .hero-icon svg{width:22px;height:22px}
+  .hero h1{font-size:22px;font-weight:600;letter-spacing:-.02em;margin:0;line-height:1.15}
+  .meta{display:flex;align-items:center;gap:9px;margin-top:6px;font-size:10.5px;color:var(--dim);flex-wrap:wrap}
+  .meta .sep{width:3px;height:3px;border-radius:50%;background:var(--faint)}
+  .meta .id{font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+  .tabs{align-self:flex-start;display:flex;gap:2px;padding:3px;border-radius:10px;background:var(--bg);border:1px solid var(--border-subtle)}
+  .tab{height:30px;padding:0 14px;border-radius:8px;display:flex;align-items:center;font-size:12px;font-weight:500;color:var(--dim)}
+  .tab.selected{background:var(--raised);color:var(--text);border:1px solid var(--border)}
+  .inspectcard{flex:1;min-height:0;background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}
+  .inspect-body{flex:1;min-height:0;padding:16px 18px;display:flex;flex-direction:column;gap:10px;overflow:hidden}
+  .section{background:var(--bg);border:1px solid var(--border-subtle);border-radius:10px;padding:12px 14px}
+  .section h3{margin:0 0 8px;font-size:10px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--dim)}
+  .kv{display:grid;grid-template-columns:190px minmax(0,1fr);gap:14px;min-height:26px;align-items:center;border-top:1px solid var(--border-subtle);font-size:11.5px}
+  .section h3 + .kv{border-top:0}
+  .kv .k{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .kv .v{font-family:var(--mono);font-size:11px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 26px}
+  .grid2 .kv:nth-child(-n+2){border-top:0}
+  .grid2 .kv{grid-template-columns:120px minmax(0,1fr)}
+  .pill-inline{display:inline-flex;align-items:center;gap:6px;height:19px;padding:0 7px;border-radius:99px;font-size:10px;font-weight:500;background:var(--running-soft);color:var(--running);font-family:Inter,sans-serif}
+  .pill-inline i{width:5px;height:5px;border-radius:50%;background:currentColor}
+  .scrollbar{position:absolute;right:3px;top:0;bottom:0;width:3px;background:var(--border);border-radius:3px;opacity:.35}
+</style>
+</head>
+<body>
+<div class="stack">
+  <!-- LIST -->
+  <div class="scale">
+    <div class="window">
+      <div class="titlebar">
+        <div class="lights"><i class="light r"></i><i class="light y"></i><i class="light g"></i></div>
+        <div class="window-title">contUI</div>
+      </div>
+      <div class="app">
+        <aside class="rail">
+          <div class="logo">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3 21 8l-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 16 9 5 9-5"/></svg>
+          </div>
+          <nav class="nav">
+            <div class="nav-item selected">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M21 8 12 3 3 8v8l9 5 9-5V8Z"/><path d="m3 8 9 5 9-5"/><path d="M12 13v8"/></svg>
+              <span>Containers</span>
+            </div>
+            <div class="nav-item">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 16 9 5 9-5"/></svg>
+              <span>Images</span>
+            </div>
+            <div class="nav-item">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
+              <span>Volumes</span>
+            </div>
+          </nav>
+          <div class="rail-bottom"><i class="dot"></i><span>Host</span></div>
+        </aside>
+        <main class="main">
+          <header class="topbar">
+            <div>
+              <div class="page-title">Containers</div>
+              <div class="page-sub">3 running · 13 stopped</div>
+            </div>
+            <div class="top-actions">
+              <button class="btn btn-primary">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3.5 20 12 5 20.5z"/></svg>
+                Run
+              </button>
+              <div class="search">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
+                <span>Search</span><span class="hint">⌘F</span>
+              </div>
+              <div class="icon-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.35 6.15"/><path d="M20 4v6h-6"/></svg>
+              </div>
+              <div class="host"><i class="dot"></i><span>rancher-desktop</span>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+              </div>
+            </div>
+          </header>
+          <div class="page">
+            <section class="overview">
+              <div class="stat active">
+                <div class="stat-head"><span class="kicker">Containers</span>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M21 8 12 3 3 8v8l9 5 9-5V8Z"/><path d="m3 8 9 5 9-5"/><path d="M12 13v8"/></svg>
+                </div>
+                <div class="stat-value"><b>3</b><em>running</em><span class="of">of 16</span></div>
+                <div class="bar"><i></i></div>
+                <div class="stat-foot">13 stopped</div>
+              </div>
+              <div class="stat">
+                <div class="stat-head"><span class="kicker">Images</span>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 16 9 5 9-5"/></svg>
+                </div>
+                <div class="stat-value"><b>45</b><em>images</em><span class="of">12 in use</span></div>
+                <div class="stat-foot">5.6 GB total</div>
+              </div>
+              <div class="stat">
+                <div class="stat-head"><span class="kicker">Volumes</span>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
+                </div>
+                <div class="stat-value"><b>1</b><em>volume</em><span class="of">local</span></div>
+                <div class="stat-foot">local driver</div>
+              </div>
+            </section>
+            <section class="tablecard">
+              <div class="thead">
+                <span>Name</span><span>State</span><span>Image</span><span>Ports</span><span>Created <span class="arrow">↑</span></span><span></span>
+              </div>
+              <div class="tbody">
+                <div class="row selected">
+                  <div class="name">sploney-db-1</div>
+                  <div><span class="pill running"><i></i>running</span></div>
+                  <div class="mono">postgres:18</div>
+                  <div class="mono">5432→5432</div>
+                  <div class="time">2m ago</div>
+                  <div class="actions">
+                    <div class="act"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.35 6.15"/><path d="M20 4v6h-6"/></svg></div>
+                    <div class="act"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6h12M6 18h12M9 9v6M15 9v6"/></svg></div>
+                    <div class="act danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 3h6l1 4H8l1-4ZM6 7l1 14h10l1-14M10 11v6M14 11v6"/></svg></div>
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="name">k8s_traefik_traefik-6cd8c7cd89-dlbpm</div>
+                  <div><span class="pill exited"><i></i>exited</span></div>
+                  <div class="mono">traefik:v3.1</div>
+                  <div class="mono">—</div>
+                  <div class="time">3mo ago</div>
+                  <div class="actions">
+                    <div class="act"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M5 3.5 20 12 5 20.5z"/></svg></div>
+                    <div class="act danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 3h6l1 4H8l1-4ZM6 7l1 14h10l1-14M10 11v6M14 11v6"/></svg></div>
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="name">k8s_POD_svclb-traefik-6cd8c</div>
+                  <div><span class="pill exited"><i></i>exited</span></div>
+                  <div class="mono">rancher/mirrored-pause:3.6</div>
+                  <div class="mono">—</div>
+                  <div class="time">3mo ago</div>
+                  <div class="actions">
+                    <div class="act"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M5 3.5 20 12 5 20.5z"/></svg></div>
+                    <div class="act danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 3h6l1 4H8l1-4ZM6 7l1 14h10l1-14M10 11v6M14 11v6"/></svg></div>
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="name">k8s_coredns_coredns-7db6d8ff4d</div>
+                  <div><span class="pill exited"><i></i>exited</span></div>
+                  <div class="mono">rancher/mirrored-coredns-coredns:1.11.1</div>
+                  <div class="mono">—</div>
+                  <div class="time">3mo ago</div>
+                  <div class="actions">
+                    <div class="act"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M5 3.5 20 12 5 20.5z"/></svg></div>
+                    <div class="act danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 3h6l1 4H8l1-4ZM6 7l1 14h10l1-14M10 11v6M14 11v6"/></svg></div>
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="name">k8s_metrics-server_metrics-server</div>
+                  <div><span class="pill exited"><i></i>exited</span></div>
+                  <div class="mono">rancher/mirrored-metrics-server:v0.7.2</div>
+                  <div class="mono">—</div>
+                  <div class="time">3mo ago</div>
+                  <div class="actions">
+                    <div class="act"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M5 3.5 20 12 5 20.5z"/></svg></div>
+                    <div class="act danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 3h6l1 4H8l1-4ZM6 7l1 14h10l1-14M10 11v6M14 11v6"/></svg></div>
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="name">k8s_local-path-provisioner</div>
+                  <div><span class="pill paused"><i></i>paused</span></div>
+                  <div class="mono">rancher/local-path-provisioner:v0.0.30</div>
+                  <div class="mono">—</div>
+                  <div class="time">3mo ago</div>
+                  <div class="actions">
+                    <div class="act"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M5 3.5 20 12 5 20.5z"/></svg></div>
+                    <div class="act danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 3h6l1 4H8l1-4ZM6 7l1 14h10l1-14M10 11v6M14 11v6"/></svg></div>
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="name">sploney-api-1</div>
+                  <div><span class="pill running"><i></i>running</span></div>
+                  <div class="mono">sploney/api:latest</div>
+                  <div class="mono">3000→3000</div>
+                  <div class="time">18m ago</div>
+                  <div class="actions">
+                    <div class="act"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.35 6.15"/><path d="M20 4v6h-6"/></svg></div>
+                    <div class="act"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6h12M6 18h12M9 9v6M15 9v6"/></svg></div>
+                    <div class="act danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 3h6l1 4H8l1-4ZM6 7l1 14h10l1-14M10 11v6M14 11v6"/></svg></div>
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="name">sploney-web-1</div>
+                  <div><span class="pill running"><i></i>running</span></div>
+                  <div class="mono">sploney/web:latest</div>
+                  <div class="mono">3001→3000</div>
+                  <div class="time">18m ago</div>
+                  <div class="actions">
+                    <div class="act"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.35 6.15"/><path d="M20 4v6h-6"/></svg></div>
+                    <div class="act"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6h12M6 18h12M9 9v6M15 9v6"/></svg></div>
+                    <div class="act danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 3h6l1 4H8l1-4ZM6 7l1 14h10l1-14M10 11v6M14 11v6"/></svg></div>
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="name">sploney-cache-1</div>
+                  <div><span class="pill running"><i></i>running</span></div>
+                  <div class="mono">redis:7-alpine</div>
+                  <div class="mono">6379→6379</div>
+                  <div class="time">18m ago</div>
+                  <div class="actions">
+                    <div class="act"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.35 6.15"/><path d="M20 4v6h-6"/></svg></div>
+                    <div class="act"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6h12M6 18h12M9 9v6M15 9v6"/></svg></div>
+                    <div class="act danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 3h6l1 4H8l1-4ZM6 7l1 14h10l1-14M10 11v6M14 11v6"/></svg></div>
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="name">k8s_ingress-nginx-controller</div>
+                  <div><span class="pill exited"><i></i>exited</span></div>
+                  <div class="mono">rancher/mirrored-ingress-nginx-controller:v1.10.1</div>
+                  <div class="mono">—</div>
+                  <div class="time">3mo ago</div>
+                  <div class="actions">
+                    <div class="act"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M5 3.5 20 12 5 20.5z"/></svg></div>
+                    <div class="act danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 3h6l1 4H8l1-4ZM6 7l1 14h10l1-14M10 11v6M14 11v6"/></svg></div>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </main>
+      </div>
+    </div>
+  </div>
+
+  <!-- DETAIL -->
+  <div class="scale">
+    <div class="window">
+      <div class="titlebar">
+        <div class="lights"><i class="light r"></i><i class="light y"></i><i class="light g"></i></div>
+        <div class="window-title">contUI</div>
+      </div>
+      <div class="app detail-app">
+        <aside class="rail">
+          <div class="logo">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3 21 8l-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 16 9 5 9-5"/></svg>
+          </div>
+          <nav class="nav">
+            <div class="nav-item selected">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M21 8 12 3 3 8v8l9 5 9-5V8Z"/><path d="m3 8 9 5 9-5"/><path d="M12 13v8"/></svg>
+              <span>Containers</span>
+            </div>
+            <div class="nav-item">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 16 9 5 9-5"/></svg>
+              <span>Images</span>
+            </div>
+            <div class="nav-item">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
+              <span>Volumes</span>
+            </div>
+          </nav>
+          <div class="rail-bottom"><i class="dot"></i><span>Host</span></div>
+        </aside>
+        <main class="main">
+          <header class="topbar detail">
+            <div class="crumb">
+              <div class="back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 5-7 7 7 7"/></svg></div>
+              <div class="crumb-title">Containers</div>
+            </div>
+            <div class="host"><i class="dot"></i><span>rancher-desktop</span>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+            </div>
+          </header>
+          <div class="page detail">
+            <section class="hero">
+              <div class="hero-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M21 8 12 3 3 8v8l9 5 9-5V8Z"/><path d="m3 8 9 5 9-5"/><path d="M12 13v8"/></svg>
+              </div>
+              <div>
+                <h1>sploney-db-1</h1>
+                <div class="meta">
+                  <span class="pill-inline"><i></i>running</span>
+                  <span class="id">8f3a1c9d4e2b</span>
+                  <i class="sep"></i>
+                  <span>postgres:18</span>
+                  <i class="sep"></i>
+                  <span>Created 2m ago</span>
+                </div>
+              </div>
+              <div class="detail-actions">
+                <button class="btn btn-ghost disabled"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M5 3.5 20 12 5 20.5z"/></svg>Start</button>
+                <button class="btn btn-ghost"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6h12M6 18h12M9 9v6M15 9v6"/></svg>Stop</button>
+                <button class="btn btn-ghost"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.35 6.15"/><path d="M20 4v6h-6"/></svg>Restart</button>
+                <button class="btn btn-danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 3h6l1 4H8l1-4ZM6 7l1 14h10l1-14M10 11v6M14 11v6"/></svg>Remove</button>
+              </div>
+            </section>
+            <div class="tabs">
+              <div class="tab selected">Inspect</div>
+              <div class="tab">Logs</div>
+            </div>
+            <section class="inspectcard">
+              <div class="inspect-body">
+                <div class="section">
+                  <h3>Overview</h3>
+                  <div class="grid2">
+                    <div class="kv"><span class="k">Id</span><span class="v">8f3a1c9d4e2b…</span></div>
+                    <div class="kv"><span class="k">Image</span><span class="v">sha256:1a2b3c4d…</span></div>
+                    <div class="kv"><span class="k">Created</span><span class="v">2026-11-15T00:41:18Z</span></div>
+                    <div class="kv"><span class="k">Platform</span><span class="v">linux/arm64</span></div>
+                    <div class="kv"><span class="k">Path</span><span class="v">docker-entrypoint.sh</span></div>
+                    <div class="kv"><span class="k">Args</span><span class="v">postgres</span></div>
+                  </div>
+                </div>
+                <div class="section">
+                  <h3>State</h3>
+                  <div class="kv"><span class="k">Status</span><span class="v">running</span></div>
+                  <div class="kv"><span class="k">Running</span><span class="v">true</span></div>
+                  <div class="kv"><span class="k">Pid</span><span class="v">48211</span></div>
+                  <div class="kv"><span class="k">StartedAt</span><span class="v">2026-11-15T00:41:19.104Z</span></div>
+                </div>
+                <div class="section">
+                  <h3>HostConfig</h3>
+                  <div class="kv"><span class="k">PortBindings</span><span class="v">5432/tcp: {HostIp: 0.0.0.0, HostPort: 5432}</span></div>
+                  <div class="kv"><span class="k">Binds</span><span class="v">sploney_db-data:/var/lib/postgresql/data</span></div>
+                  <div class="kv"><span class="k">NetworkMode</span><span class="v">sploney_default</span></div>
+                  <div class="kv"><span class="k">RestartPolicy</span><span class="v">{Name: unless-stopped, MaximumRetryCount: 0}</span></div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </main>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
