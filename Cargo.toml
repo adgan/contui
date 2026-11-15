@@ -1,6 +1,6 @@
 [package]
 name = "contui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 
@@ -15,6 +15,7 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "runtime_shaders", "test-support"] }
 tempfile = "3"
 sha2 = "0.10"
 

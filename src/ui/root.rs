@@ -2,7 +2,9 @@ use crate::docker::actions::{
     ActionKind, ContainerAction, Proto, RunField, RunForm, Target, build_run_spec,
 };
 use crate::docker::endpoint::{HostInfo, HostStatus, discover};
-use crate::docker::model::{ContainerState, ContainerUsage, ResourceKind, Snapshot};
+use crate::docker::model::{
+    ContainerRow, ContainerState, ContainerStats, ResourceKind, Snapshot,
+};
 use crate::docker::service::{DockerService, PullOrigin, Request, Response};
 use crate::theme::Theme;
 use crate::ui::detail::DetailState;
@@ -109,7 +111,6 @@ fn reset_host_data(
     snapshot: &mut Snapshot,
     tables: &mut [TableState; 3],
     detail: &mut Option<DetailState>,
-    usage: &mut HashMap<String, ContainerUsage>,
 ) {
     *snapshot = Snapshot::empty();
     for table in tables.iter_mut() {
@@ -118,25 +119,38 @@ fn reset_host_data(
         table.selected = None;
     }
     *detail = None;
-    usage.clear();
 }
 
-/// Live usage is only meaningful while the host is connected; a red host chip
+/// Live stats are only meaningful while the host is connected; a red host chip
 /// must not sit beside a frozen number.
-fn keeps_usage(status: &HostStatus) -> bool {
+fn keeps_stats(status: &HostStatus) -> bool {
     matches!(status, HostStatus::Connected)
 }
 
-/// Drops samples for containers that stopped or disappeared, so the map only
-/// ever carries running containers.
-fn retain_running_usage(usage: &mut HashMap<String, ContainerUsage>, snapshot: &Snapshot) {
-    let running: HashSet<&str> = snapshot
-        .containers
+/// The set of containers whose stats the UI can currently show. The overview
+/// usage card is global, so every list page needs the running containers; the
+/// detail page only needs the container it shows. Compose collapse and the
+/// search query deliberately do not prune: the list keeps every running
+/// container's stream alive, like Docker Desktop.
+fn stats_targets_for(
+    detail: Option<&DetailState>,
+    containers: &[ContainerRow],
+) -> HashSet<String> {
+    if let Some(detail) = detail {
+        if detail.kind != ResourceKind::Container {
+            return HashSet::new();
+        }
+        return containers
+            .iter()
+            .filter(|c| c.id == detail.id && c.state == ContainerState::Running)
+            .map(|c| c.id.clone())
+            .collect();
+    }
+    containers
         .iter()
-        .filter(|container| container.state == ContainerState::Running)
-        .map(|container| container.id.as_str())
-        .collect();
-    usage.retain(|id, _| running.contains(id.as_str()));
+        .filter(|c| c.state == ContainerState::Running)
+        .map(|c| c.id.clone())
+        .collect()
 }
 
 pub struct RootView {
@@ -144,8 +158,9 @@ pub struct RootView {
     pub theme: Theme,
     pub service: Option<DockerService>,
     pub snapshot: Snapshot,
-    pub usage: HashMap<String, ContainerUsage>,
     pub stats: OverviewStats,
+    pub container_stats: HashMap<String, ContainerStats>,
+    watched_stats: HashSet<String>,
     pub status: HostStatus,
     pub hosts: Vec<HostInfo>,
     pub active_host: Option<String>,
@@ -180,13 +195,14 @@ impl RootView {
             theme: theme.clone(),
             service: None,
             snapshot: Snapshot::empty(),
-            usage: HashMap::new(),
             stats: OverviewStats::default(),
+            container_stats: HashMap::new(),
+            watched_stats: HashSet::new(),
             status: HostStatus::Unknown,
             hosts: discovery.hosts,
             active_host: discovery.active,
             tables: [
-                crate::ui::tables::containers_table(&empty),
+                crate::ui::tables::containers_table(&empty, &HashMap::new()),
                 crate::ui::tables::images_table(&empty),
                 crate::ui::tables::volumes_table(&empty),
             ],
@@ -220,12 +236,9 @@ impl RootView {
         self.service = None;
         self._pump = None;
         self.host_menu_open = false;
-        reset_host_data(
-            &mut self.snapshot,
-            &mut self.tables,
-            &mut self.detail,
-            &mut self.usage,
-        );
+        reset_host_data(&mut self.snapshot, &mut self.tables, &mut self.detail);
+        self.container_stats.clear();
+        self.watched_stats.clear();
         self.mutations = Mutations::new();
         self.run_focus = None;
         self.last_error = None;
@@ -271,7 +284,14 @@ impl RootView {
             Response::Snapshot(snapshot) => {
                 self.stats = OverviewStats::from_snapshot(&snapshot);
                 self.snapshot = snapshot;
-                retain_running_usage(&mut self.usage, &self.snapshot);
+                let running: HashSet<String> = self
+                    .snapshot
+                    .containers
+                    .iter()
+                    .filter(|container| container.state == ContainerState::Running)
+                    .map(|container| container.id.clone())
+                    .collect();
+                self.container_stats.retain(|id, _| running.contains(id));
                 self.rebuild_tables();
                 self.last_error = None;
                 if let Some(id) = self.mutations.pending_select.take() {
@@ -304,10 +324,11 @@ impl RootView {
                         detail.missing = true;
                     }
                 }
+                self.sync_stats_targets();
             }
             Response::Status(status) => {
-                if !keeps_usage(&status) {
-                    self.usage.clear();
+                if !keeps_stats(&status) {
+                    self.container_stats.clear();
                 }
                 let had_work = self.mutations.has_in_flight();
                 if should_refetch_on_status(&self.status, &status) {
@@ -335,12 +356,6 @@ impl RootView {
                         host.status = status;
                     }
                 }
-            }
-            Response::Usage { id, usage } => {
-                self.usage.insert(id, usage);
-            }
-            Response::UsageStale { id } => {
-                self.usage.remove(&id);
             }
             Response::Dirty { .. } => {
                 // Keep the open inspect tree on screen while the refetch runs.
@@ -460,11 +475,49 @@ impl RootView {
                         .apply_run_failed(message, missing_image, created, epoch);
                 self.apply_run_outcome(outcome);
             }
+            Response::Stats { id, stats } => {
+                if self.watched_stats.contains(&id) {
+                    self.container_stats.insert(id, stats);
+                    self.refresh_container_rows();
+                }
+            }
+            Response::StatsStale { id } => {
+                if self.container_stats.remove(&id).is_some() {
+                    self.refresh_container_rows();
+                }
+            }
         }
     }
 
     fn rebuild_tables(&mut self) {
-        self.tables = crate::ui::tables::tables_from(&self.snapshot, &self.tables);
+        self.tables =
+            crate::ui::tables::tables_from(&self.snapshot, &self.container_stats, &self.tables);
+    }
+
+    /// Repaints the containers rows from the current readings without a full
+    /// table rebuild, so scroll and selection survive a sample.
+    fn refresh_container_rows(&mut self) {
+        if self.page != Page::Containers {
+            return;
+        }
+        let rows =
+            crate::ui::tables::containers_table(&self.snapshot, &self.container_stats).rows;
+        self.tables[Page::Containers.index()].replace_rows(rows);
+    }
+
+    /// Aligns the service's stats streams with what the page and detail show.
+    /// Readings for running containers are kept across the switch so returning
+    /// from a detail page does not blank the overview card; the snapshot path
+    /// drops readings for containers that stopped.
+    fn sync_stats_targets(&mut self) {
+        let targets = stats_targets_for(self.detail.as_ref(), &self.snapshot.containers);
+        self.watched_stats = targets.clone();
+        self.refresh_container_rows();
+        if let Some(service) = &self.service {
+            service.request(Request::WatchStats {
+                ids: targets.into_iter().collect(),
+            });
+        }
     }
 
     pub fn switch_page(&mut self, page: Page) {
@@ -473,6 +526,7 @@ impl RootView {
         self.host_menu_open = false;
         self.mutations.pull_open = false;
         self.refresh_if_stale();
+        self.sync_stats_targets();
     }
 
     /// The containers list as displayed: Compose project headers with their
@@ -803,10 +857,12 @@ impl RootView {
         if let Some(service) = &self.service {
             service.request(Request::Inspect { kind, id });
         }
+        self.sync_stats_targets();
     }
 
     fn close_detail(&mut self) {
         self.detail = None;
+        self.sync_stats_targets();
     }
 
     fn open_detail_by_id(&mut self, kind: ResourceKind, id: &str) {
@@ -957,7 +1013,7 @@ impl RootView {
     }
 }
 
-/// One visible line in the grouped containers list. Group headers are 44px
+/// One visible line in the grouped containers list. Group headers are 52px
 /// like data rows, so `uniform_list` keeps working.
 #[derive(Clone, Debug, PartialEq)]
 enum ContainerSlot {
@@ -1096,7 +1152,7 @@ mod tests {
             ],
             ..Snapshot::empty()
         };
-        let table = crate::ui::tables::containers_table(&snapshot);
+        let table = crate::ui::tables::containers_table(&snapshot, &HashMap::new());
         let slots = compose_slots(&table, &snapshot.containers, &HashSet::new(), false).unwrap();
 
         let groups: Vec<(&str, usize, usize)> = slots
@@ -1161,7 +1217,7 @@ mod tests {
             containers: vec![container("plain", ContainerState::Running)],
             ..Snapshot::empty()
         };
-        let table = crate::ui::tables::containers_table(&snapshot);
+        let table = crate::ui::tables::containers_table(&snapshot, &HashMap::new());
         assert!(compose_slots(&table, &snapshot.containers, &HashSet::new(), false).is_none());
     }
 
@@ -1206,7 +1262,7 @@ mod tests {
             ..Snapshot::empty()
         };
         let mut tables = [
-            crate::ui::tables::containers_table(&snapshot),
+            crate::ui::tables::containers_table(&snapshot, &HashMap::new()),
             crate::ui::tables::images_table(&snapshot),
             crate::ui::tables::volumes_table(&snapshot),
         ];
@@ -1217,44 +1273,46 @@ mod tests {
             "alpha-id".into(),
             "alpha".into(),
         ));
-        let mut usage = HashMap::from([("alpha-id".to_string(), ContainerUsage::default())]);
-
-        reset_host_data(&mut snapshot, &mut tables, &mut detail, &mut usage);
+        reset_host_data(&mut snapshot, &mut tables, &mut detail);
 
         assert!(snapshot.containers.is_empty());
         assert!(tables[0].rows.is_empty());
         assert_eq!(tables[0].query, "");
         assert!(detail.is_none());
-        assert!(usage.is_empty());
     }
 
     #[test]
-    fn retain_running_usage_drops_stopped_and_missing_containers() {
-        let snapshot = Snapshot {
-            containers: vec![
-                container("alpha", ContainerState::Running),
-                container("beta", ContainerState::Exited),
-            ],
-            ..Snapshot::empty()
-        };
-        let mut usage = HashMap::from([
-            ("alpha-id".to_string(), ContainerUsage::default()),
-            ("beta-id".to_string(), ContainerUsage::default()),
-            ("gone-id".to_string(), ContainerUsage::default()),
-        ]);
-
-        retain_running_usage(&mut usage, &snapshot);
-
-        assert!(usage.contains_key("alpha-id"));
-        assert!(!usage.contains_key("beta-id"));
-        assert!(!usage.contains_key("gone-id"));
+    fn stats_are_only_kept_while_the_host_is_connected() {
+        assert!(keeps_stats(&HostStatus::Connected));
+        assert!(!keeps_stats(&HostStatus::Unknown));
+        assert!(!keeps_stats(&HostStatus::Unreachable("gone".into())));
+        assert!(!keeps_stats(&HostStatus::AuthFailed("denied".into())));
     }
 
     #[test]
-    fn usage_is_only_kept_while_the_host_is_connected() {
-        assert!(keeps_usage(&HostStatus::Connected));
-        assert!(!keeps_usage(&HostStatus::Unknown));
-        assert!(!keeps_usage(&HostStatus::Unreachable("gone".into())));
-        assert!(!keeps_usage(&HostStatus::AuthFailed("denied".into())));
+    fn stats_targets_follow_detail_and_the_global_usage_card() {
+        let containers = vec![
+            container("web", ContainerState::Running),
+            container("db", ContainerState::Running),
+            container("job", ContainerState::Exited),
+        ];
+        // The overview usage card is global, so every list page watches every
+        // running container.
+        assert_eq!(
+            stats_targets_for(None, &containers),
+            HashSet::from(["web-id".to_string(), "db-id".to_string()])
+        );
+
+        let web = DetailState::new(ResourceKind::Container, "web-id".into(), "web".into());
+        assert_eq!(
+            stats_targets_for(Some(&web), &containers),
+            HashSet::from(["web-id".to_string()])
+        );
+
+        let stopped = DetailState::new(ResourceKind::Container, "job-id".into(), "job".into());
+        assert!(stats_targets_for(Some(&stopped), &containers).is_empty());
+
+        let image = DetailState::new(ResourceKind::Image, "web-id".into(), "web".into());
+        assert!(stats_targets_for(Some(&image), &containers).is_empty());
     }
 }

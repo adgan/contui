@@ -1,5 +1,5 @@
 use crate::docker::model::{
-    ContainerState, ContainerUsage, Snapshot, format_bytes, format_cpu_percent, format_usage_bytes,
+    ContainerState, ContainerStats, Snapshot, format_bytes, format_cpu,
 };
 use gpui::SharedString;
 use std::collections::HashMap;
@@ -130,7 +130,7 @@ pub struct UsageTotals {
 }
 
 impl UsageTotals {
-    pub fn from_snapshot(snapshot: &Snapshot, usage: &HashMap<String, ContainerUsage>) -> Self {
+    pub fn from_snapshot(snapshot: &Snapshot, stats: &HashMap<String, ContainerStats>) -> Self {
         let mut totals = Self::default();
 
         for container in &snapshot.containers {
@@ -138,7 +138,7 @@ impl UsageTotals {
                 continue;
             }
             totals.running += 1;
-            let Some(sample) = usage.get(&container.id) else {
+            let Some(sample) = stats.get(&container.id) else {
                 continue;
             };
             if let Some(cpu) = sample.cpu_percent {
@@ -147,8 +147,8 @@ impl UsageTotals {
                 );
                 totals.cpu_reporting += 1;
             }
-            if let Some(memory) = sample.memory_usage {
-                totals.memory_bytes = Some(totals.memory_bytes.unwrap_or(0) + memory);
+            if let Some(memory) = sample.memory {
+                totals.memory_bytes = Some(totals.memory_bytes.unwrap_or(0) + memory.used);
                 totals.memory_reporting += 1;
             }
         }
@@ -184,16 +184,13 @@ impl UsageCardLabels {
         }
         if totals.running == 0 {
             return Self {
-                value: "0.00%".into(),
+                value: "0.0%".into(),
                 right: "0 running".into(),
                 foot: "no running containers".into(),
             };
         }
 
-        let value = totals
-            .cpu_percent
-            .map(format_cpu_percent)
-            .unwrap_or_else(|| "—".into());
+        let value = format_cpu(totals.cpu_percent).unwrap_or_else(|| "—".into());
         let right = if totals.cpu_reporting < totals.running {
             format!("{} of {}", totals.cpu_reporting, totals.running)
         } else {
@@ -201,7 +198,7 @@ impl UsageCardLabels {
         };
         let foot = match totals.memory_bytes {
             Some(memory) => {
-                let base = format!("{} memory", format_usage_bytes(memory));
+                let base = format!("{} memory", format_bytes(memory as i64));
                 if totals.memory_reporting < totals.running {
                     format!("{base} · {}/{}", totals.memory_reporting, totals.running)
                 } else {
@@ -218,7 +215,7 @@ impl UsageCardLabels {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::docker::model::{ContainerRow, ImageRow, VolumeRow};
+    use crate::docker::model::{ContainerRow, ImageRow, MemoryUsage, VolumeRow};
     use chrono::{DateTime, Utc};
     use gpui::SharedString;
 
@@ -378,28 +375,37 @@ mod tests {
         let usage = HashMap::from([
             (
                 "a-id".to_string(),
-                ContainerUsage {
+                ContainerStats {
                     cpu_percent: Some(100.0),
-                    memory_usage: Some(1_000),
-                    memory_limit: None,
+                    memory: Some(MemoryUsage {
+                        used: 1_000,
+                        limit: 0,
+                        percent: None,
+                    }),
                     online_cpus: 2,
                 },
             ),
             (
                 "b-id".to_string(),
-                ContainerUsage {
+                ContainerStats {
                     cpu_percent: Some(200.0),
-                    memory_usage: Some(2_000),
-                    memory_limit: None,
+                    memory: Some(MemoryUsage {
+                        used: 2_000,
+                        limit: 0,
+                        percent: None,
+                    }),
                     online_cpus: 4,
                 },
             ),
             (
                 "c-id".to_string(),
-                ContainerUsage {
+                ContainerStats {
                     cpu_percent: Some(999.0),
-                    memory_usage: Some(9_999),
-                    memory_limit: None,
+                    memory: Some(MemoryUsage {
+                        used: 9_999,
+                        limit: 0,
+                        percent: None,
+                    }),
                     online_cpus: 1,
                 },
             ),
@@ -422,7 +428,7 @@ mod tests {
             running: 3,
         };
         let labels = UsageCardLabels::from(&totals, true, true);
-        assert_eq!(labels.value, "4.10%");
+        assert_eq!(labels.value, "4.1%");
         assert_eq!(labels.right, "2 of 3");
         assert_eq!(labels.foot, "1.2 GB memory");
     }
@@ -463,7 +469,7 @@ mod tests {
         assert_eq!(
             UsageCardLabels::from(&empty, true, true),
             UsageCardLabels {
-                value: "0.00%".into(),
+                value: "0.0%".into(),
                 right: "0 running".into(),
                 foot: "no running containers".into()
             }

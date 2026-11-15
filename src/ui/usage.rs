@@ -1,6 +1,4 @@
-use crate::docker::model::{
-    ContainerState, ContainerUsage, format_cpu_percent, format_memory_pair,
-};
+use crate::docker::model::{ContainerState, ContainerStats, format_cpu, format_memory};
 use crate::theme::{Theme, space, type_scale};
 use crate::ui::style::Layout;
 use gpui::prelude::*;
@@ -18,41 +16,33 @@ pub struct DetailUsage {
 }
 
 impl DetailUsage {
-    pub fn from(usage: Option<&ContainerUsage>, state: ContainerState, connected: bool) -> Self {
+    pub fn from(stats: Option<&ContainerStats>, state: ContainerState, connected: bool) -> Self {
         if !connected {
             return Self::placeholder("host disconnected");
         }
         if state != ContainerState::Running {
             return Self::placeholder("container is not running");
         }
-        let Some(usage) = usage else {
+        let Some(stats) = stats else {
             return Self::placeholder("waiting for stats…");
         };
 
-        let cpu = usage
-            .cpu_percent
-            .map(format_cpu_percent)
-            .unwrap_or_else(|| "—".into());
-        let cpu_sub = if usage.cpu_percent.is_some() {
+        let cpu = format_cpu(stats.cpu_percent).unwrap_or_else(|| "—".into());
+        let cpu_sub = if stats.cpu_percent.is_some() {
             "of one core".into()
         } else {
             "waiting for stats…".into()
         };
-        let memory = usage
-            .memory_usage
-            .map(|memory| format_memory_pair(memory, usage.memory_limit))
-            .unwrap_or_else(|| "—".into());
-        let memory_sub = if usage.memory_usage.is_some() {
+        let memory = format_memory(stats.memory).unwrap_or_else(|| "—".into());
+        let memory_sub = if stats.memory.is_some() {
             String::new()
         } else {
             "waiting for stats…".into()
         };
-        let memory_fraction = match (usage.memory_usage, usage.memory_limit) {
-            (Some(used), Some(limit)) if limit > 0 => {
-                Some((used as f32 / limit as f32).clamp(0.0, 1.0))
-            }
-            _ => None,
-        };
+        let memory_fraction = stats
+            .memory
+            .and_then(|memory| memory.percent)
+            .map(|percent| (percent / 100.0).clamp(0.0, 1.0));
 
         Self {
             cpu,
@@ -179,13 +169,20 @@ fn metric_cell(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::docker::model::{ContainerState, ContainerUsage};
+    use crate::docker::model::{ContainerState, ContainerStats, MemoryUsage};
 
-    fn usage(cpu: Option<f32>, memory: Option<u64>, limit: Option<u64>) -> ContainerUsage {
-        ContainerUsage {
+    fn usage(cpu: Option<f32>, memory: Option<u64>, limit: Option<u64>) -> ContainerStats {
+        let limit = limit.unwrap_or(0);
+        let percent = memory.and_then(|used| {
+            (limit > 0).then(|| used as f32 / limit as f32 * 100.0)
+        });
+        ContainerStats {
             cpu_percent: cpu,
-            memory_usage: memory,
-            memory_limit: limit,
+            memory: memory.map(|used| MemoryUsage {
+                used,
+                limit,
+                percent,
+            }),
             online_cpus: 1,
         }
     }
@@ -194,7 +191,7 @@ mod tests {
     fn running_container_shows_cpu_memory_and_fraction() {
         let value = usage(Some(0.42), Some(1_048_576), Some(2_097_152));
         let detail = DetailUsage::from(Some(&value), ContainerState::Running, true);
-        assert_eq!(detail.cpu, "0.42%");
+        assert_eq!(detail.cpu, "0.4%");
         assert_eq!(detail.cpu_sub, "of one core");
         assert_eq!(detail.memory, "1.0 MB / 2.0 MB");
         assert_eq!(detail.memory_fraction, Some(0.5));

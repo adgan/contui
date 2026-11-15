@@ -1,7 +1,14 @@
 # contUI — live usage overview and container detail — design
 
 Date: 2026-11-15
-Status: awaiting approval
+Status: merged with `2026-11-15-live-container-stats-design.md`
+
+> **Merge note.** `main` landed live container stats first (CPU/MEM columns, a
+> steered `WatchStats` lifecycle, a 2s UI cadence, the detail hero readings).
+> This branch keeps that code and layers the overview Usage card and the detail
+> usage band on top; the `ContainerUsage`/`Response::Usage` names below became
+> `ContainerStats`/`Response::Stats`, and streams now follow what the page
+> shows. The "no columns" scope line is superseded by `main`.
 
 ## Intent
 

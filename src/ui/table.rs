@@ -41,6 +41,27 @@ pub enum ColumnWidth {
     Flex(f32),
 }
 
+/// How a declared width becomes flex geometry: fixed pixels, or a grow weight
+/// used with a zero basis so every row divides the leftover space the same way.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColumnLayout {
+    pub fixed: Option<f32>,
+    pub grow: f32,
+}
+
+pub fn column_layout(width: ColumnWidth) -> ColumnLayout {
+    match width {
+        ColumnWidth::Fixed(value) => ColumnLayout {
+            fixed: Some(value),
+            grow: 0.0,
+        },
+        ColumnWidth::Flex(weight) => ColumnLayout {
+            fixed: None,
+            grow: weight,
+        },
+    }
+}
+
 /// How one data column renders. Pills are used for live container state; the
 /// cell text still drives filtering and sorting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +70,15 @@ pub enum CellStyle {
     Mono,
     Timestamp,
     Pill,
+    Cpu,
+    Memory,
+}
+
+/// The first text column — container name, image repository, volume name — is
+/// the only cell allowed to wrap. Everything else stays a single ellipsized
+/// line so row heights stay uniform.
+pub fn cell_wraps(column: usize, style: CellStyle) -> bool {
+    column == 0 && style == CellStyle::Text
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +160,15 @@ impl TableState {
         self.recompute();
     }
 
+    /// Swaps the rows under an existing table, keeping its spec and scroll
+    /// handle. Selection follows the row id rather than the index.
+    pub fn replace_rows(&mut self, rows: Vec<TableRow>) {
+        let selected_id = self.selected_row().map(|row| row.id.clone());
+        self.rows = rows;
+        self.recompute();
+        self.selected = selected_id.and_then(|id| self.rows.iter().position(|row| row.id == id));
+    }
+
     pub fn set_query(&mut self, query: &str) {
         if self.query == query {
             return;
@@ -143,6 +182,7 @@ impl TableState {
     pub fn adopt_state(&mut self, previous: &TableState) {
         self.query = previous.query.clone();
         self.sort = previous.sort;
+        self.scroll = previous.scroll.clone();
         let selected_id = previous.selected_row().map(|row| row.id.clone());
         self.recompute();
         self.selected = selected_id.and_then(|id| self.rows.iter().position(|row| row.id == id));
@@ -432,5 +472,52 @@ mod tests {
         assert!(s.style_count_matches_columns());
         s.styles.pop();
         assert!(!s.style_count_matches_columns());
+    }
+
+    #[test]
+    fn replace_rows_keeps_selection_by_row_id_and_scroll_handle() {
+        let mut t = TableState::new(spec());
+        t.set_rows(vec![row("a", "alpha", "img"), row("b", "beta", "img")]);
+        t.selected = Some(1);
+        t.click_header(0);
+        let scroll = t.scroll.clone();
+
+        t.replace_rows(vec![row("b", "beta", "img"), row("a", "alpha", "img")]);
+        assert_eq!(t.selected, Some(0), "selection follows b");
+        assert_eq!(t.rows[0].id, "b");
+        assert_eq!(t.sort, Some((0, true)));
+        assert!(std::rc::Rc::ptr_eq(&t.scroll.0, &scroll.0));
+    }
+
+    #[test]
+    fn adopt_state_keeps_the_same_scroll_handle() {
+        let previous = TableState::new(spec());
+        let mut fresh = TableState::new(spec());
+        fresh.adopt_state(&previous);
+        assert!(std::rc::Rc::ptr_eq(&fresh.scroll.0, &previous.scroll.0));
+    }
+
+    #[test]
+    fn column_layout_fixes_fixed_columns_and_weights_flex_columns() {
+        assert_eq!(
+            column_layout(ColumnWidth::Fixed(104.0)),
+            ColumnLayout {
+                fixed: Some(104.0),
+                grow: 0.0
+            }
+        );
+        let flex = column_layout(ColumnWidth::Flex(2.2));
+        assert_eq!(flex.fixed, None);
+        assert_eq!(flex.grow, 2.2);
+        assert_eq!(column_layout(ColumnWidth::Flex(1.0)).grow, 1.0);
+    }
+
+    #[test]
+    fn only_the_first_text_column_wraps() {
+        assert!(cell_wraps(0, CellStyle::Text));
+        assert!(!cell_wraps(0, CellStyle::Mono));
+        assert!(!cell_wraps(0, CellStyle::Timestamp));
+        assert!(!cell_wraps(0, CellStyle::Pill));
+        assert!(!cell_wraps(1, CellStyle::Text));
     }
 }

@@ -9,7 +9,7 @@ First version scope: **containers, images and volumes**, read-only.
 - Lists every container (running and stopped), image, and volume for the selected Docker host.
 - Navigates like Docker Desktop: an icon rail, a sortable table per resource, search, and a detail page per row with **Inspect** and **Logs** tabs.
 - Stays live: subscribes to `GET /events` and refreshes within ~250ms of a container starting, stopping or dying. No polling timer.
-- Shows host-wide CPU and memory for running containers in the overview strip, and live CPU/memory for the open container on its detail page. Each running container has one `/stats` stream; stopped containers have none.
+- Shows live CPU and memory for running containers: `CPU` and `MEM` columns in the list, a host-wide usage card in the overview strip, and CPU/memory for the open container on its detail page. One `/stats` stream per running container on screen, forwarded every ~2s. Stopped containers show `—`; a stalled stream drops back to `—` instead of freezing a number.
 - Finds any local Docker host: `DOCKER_HOST`, `DOCKER_CONTEXT`, every context in `~/.docker/contexts` (Rancher Desktop, Docker Desktop, Colima, OrbStack all register one), and the common socket paths. A host switcher in the header probes each one on open.
 - Tells you the truth when the engine is down: the header chip turns red, a banner or the empty area names the problem (an unreachable socket and a permission error read differently), Retry and ⌘R both re-ask, and the last known rows stay on screen instead of vanishing. When the engine comes back the list refetches itself — events that happened while it was down are never replayed.
 
@@ -32,10 +32,10 @@ Containers, images and volumes are no longer read-only:
 
 ## Install with Homebrew
 
-A public tap carries the app: `brew install --HEAD adgan/tap/contui`. The
-[tap README](https://github.com/adgan/homebrew-tap) covers trust, launch, upgrade and
-uninstall. It is a source build until the first tagged release, so it needs Rust and the
-Xcode Command Line Tools.
+A public tap carries the app: `brew install adgan/tap/contui`. It installs a prebuilt
+bottle for arm64 macOS 26 (Tahoe) — no Rust, no compile. `brew install --HEAD` builds from
+source for development. The [tap README](https://github.com/adgan/homebrew-tap) covers
+trust, launch, upgrade and uninstall.
 
 ## Build and run
 

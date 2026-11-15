@@ -77,93 +77,6 @@ impl ContainerRow {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ContainerUsage {
-    /// Docker's per-container percentage: 100% is one full core.
-    pub cpu_percent: Option<f32>,
-    /// Working set, with the cgroup cache/inactive file subtracted.
-    pub memory_usage: Option<u64>,
-    pub memory_limit: Option<u64>,
-    /// The divisor used for `cpu_percent`, kept with the sample so host totals
-    /// can normalize each container independently.
-    pub online_cpus: u32,
-}
-
-impl ContainerUsage {
-    pub fn from_sample(sample: &ContainerStatsResponse) -> Option<Self> {
-        let cpu_stats = sample.cpu_stats.as_ref();
-        let online_cpus = cpu_stats.map(online_cpus).unwrap_or(1);
-        let cpu_percent = cpu_stats
-            .and_then(|cpu| sample.precpu_stats.as_ref().map(|previous| (cpu, previous)))
-            .and_then(|(cpu, previous)| cpu_percent(cpu, previous, online_cpus));
-        let memory = sample.memory_stats.as_ref().and_then(memory_usage);
-
-        if cpu_percent.is_none() && memory.is_none() {
-            return None;
-        }
-
-        Some(Self {
-            cpu_percent,
-            memory_usage: memory.map(|(usage, _)| usage),
-            memory_limit: memory.and_then(|(_, limit)| limit),
-            online_cpus,
-        })
-    }
-}
-
-fn online_cpus(stats: &ContainerCpuStats) -> u32 {
-    stats
-        .online_cpus
-        .filter(|count| *count > 0)
-        .or_else(|| {
-            stats
-                .cpu_usage
-                .as_ref()
-                .and_then(|usage| usage.percpu_usage.as_ref())
-                .map(|cores| cores.len() as u32)
-                .filter(|count| *count > 0)
-        })
-        .unwrap_or(1)
-}
-
-fn cpu_percent(
-    stats: &ContainerCpuStats,
-    previous: &ContainerCpuStats,
-    online_cpus: u32,
-) -> Option<f32> {
-    let previous_system = previous.system_cpu_usage?;
-    if previous_system == 0 {
-        return None;
-    }
-    let system_delta = stats.system_cpu_usage?.checked_sub(previous_system)?;
-    if system_delta == 0 {
-        return None;
-    }
-    let total = stats.cpu_usage.as_ref()?.total_usage?;
-    let previous_total = previous.cpu_usage.as_ref()?.total_usage?;
-    let cpu_delta = total.saturating_sub(previous_total) as f64;
-    Some(((cpu_delta / system_delta as f64) * online_cpus as f64 * 100.0) as f32)
-}
-
-fn memory_usage(stats: &ContainerMemoryStats) -> Option<(u64, Option<u64>)> {
-    let usage = stats.usage?;
-    let cache = stats
-        .stats
-        .as_ref()
-        .and_then(|values| {
-            values
-                .get("total_inactive_file")
-                .or_else(|| values.get("inactive_file"))
-                .or_else(|| values.get("cache"))
-                .copied()
-        })
-        .unwrap_or(0);
-    Some((
-        usage.saturating_sub(cache),
-        stats.limit.filter(|limit| *limit > 0),
-    ))
-}
-
 #[derive(Clone, Debug)]
 pub struct ImageRow {
     pub id: String,
@@ -221,6 +134,113 @@ impl VolumeRow {
             created_label: created_label.into(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MemoryUsage {
+    pub used: u64,
+    pub limit: u64,
+    /// `None` when the daemon reports no memory limit.
+    pub percent: Option<f32>,
+}
+
+/// One live reading for a container. CPU becomes available one sample after
+/// the stream opens; memory can be ready on the first frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContainerStats {
+    pub cpu_percent: Option<f32>,
+    pub memory: Option<MemoryUsage>,
+    /// The core count that produced `cpu_percent`, kept with the sample so host
+    /// totals can normalize each container independently.
+    pub online_cpus: u32,
+}
+
+impl ContainerStats {
+    pub fn from_response(response: &ContainerStatsResponse) -> Option<Self> {
+        let cpu_percent = cpu_percent(response);
+        let memory = response.memory_stats.as_ref().and_then(memory_usage);
+        let online_cpus = response
+            .cpu_stats
+            .as_ref()
+            .map(online_cpus)
+            .unwrap_or(1);
+        (cpu_percent.is_some() || memory.is_some()).then_some(Self {
+            cpu_percent,
+            memory,
+            online_cpus,
+        })
+    }
+}
+
+fn online_cpus(cpu: &ContainerCpuStats) -> u32 {
+    cpu.online_cpus
+        .or_else(|| {
+            cpu.cpu_usage
+                .as_ref()
+                .and_then(|usage| usage.percpu_usage.as_ref())
+                .map(|cores| cores.len() as u32)
+        })
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Docker's formula: the container's CPU-time delta over the host's CPU-time
+/// delta, times the online core count. A first frame has zeroed previous
+/// totals, so it maps to `None` instead of a fabricated 0%.
+fn cpu_percent(response: &ContainerStatsResponse) -> Option<f32> {
+    let cpu = response.cpu_stats.as_ref()?;
+    let previous = response.precpu_stats.as_ref()?;
+    let total = cpu.cpu_usage.as_ref()?.total_usage?;
+    let previous_total = previous.cpu_usage.as_ref()?.total_usage?;
+    let system = cpu.system_cpu_usage?;
+    let previous_system = previous.system_cpu_usage?;
+    if previous_total == 0 || previous_system == 0 || system <= previous_system {
+        return None;
+    }
+    let cpu_delta = total.saturating_sub(previous_total) as f64;
+    let system_delta = (system - previous_system) as f64;
+    let cores = online_cpus(cpu);
+    Some(((cpu_delta / system_delta) * cores as f64 * 100.0).max(0.0) as f32)
+}
+
+fn memory_usage(memory: &ContainerMemoryStats) -> Option<MemoryUsage> {
+    let used = memory.usage?;
+    let cache = memory
+        .stats
+        .as_ref()
+        .and_then(|stats| {
+            stats
+                .get("total_inactive_file")
+                .or_else(|| stats.get("inactive_file"))
+        })
+        .copied()
+        .unwrap_or(0);
+    let used = used.saturating_sub(cache);
+    let limit = memory.limit.unwrap_or(0);
+    let percent = (limit > 0).then(|| (used as f64 / limit as f64 * 100.0) as f32);
+    Some(MemoryUsage {
+        used,
+        limit,
+        percent,
+    })
+}
+
+pub fn format_cpu(percent: Option<f32>) -> Option<String> {
+    percent.map(|percent| format!("{:.1}%", percent.max(0.0)))
+}
+
+pub fn format_memory(memory: Option<MemoryUsage>) -> Option<String> {
+    memory.map(|memory| {
+        if memory.limit == 0 {
+            format_bytes(memory.used as i64)
+        } else {
+            format!(
+                "{} / {}",
+                format_bytes(memory.used as i64),
+                format_bytes(memory.limit as i64)
+            )
+        }
+    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -282,41 +302,6 @@ pub fn format_bytes(n: i64) -> String {
         format!("{:.0} MB", bytes / mib)
     } else {
         format!("{:.1} MB", bytes / mib)
-    }
-}
-
-pub fn format_cpu_percent(percent: f32) -> String {
-    format!("{percent:.2}%")
-}
-
-pub fn format_usage_bytes(bytes: u64) -> String {
-    let bytes = bytes as f64;
-    let kib = 1024.0;
-    let mib = kib * 1024.0;
-    let gib = mib * 1024.0;
-    if bytes >= gib {
-        format!("{:.1} GB", bytes / gib)
-    } else if bytes >= 100.0 * mib {
-        format!("{:.0} MB", bytes / mib)
-    } else if bytes >= mib {
-        format!("{:.1} MB", bytes / mib)
-    } else if bytes >= kib {
-        format!("{:.0} KB", bytes / kib)
-    } else {
-        format!("{bytes:.0} B")
-    }
-}
-
-pub fn format_memory_pair(usage: u64, limit: Option<u64>) -> String {
-    match limit {
-        Some(limit) if limit > 0 => {
-            format!(
-                "{} / {}",
-                format_usage_bytes(usage),
-                format_usage_bytes(limit)
-            )
-        }
-        _ => format_usage_bytes(usage),
     }
 }
 
@@ -432,7 +417,6 @@ pub fn status_from_error(error: &bollard::errors::Error) -> HostStatus {
 mod tests {
     use super::*;
     use bollard::models::{
-        ContainerCpuStats, ContainerCpuUsage, ContainerMemoryStats, ContainerStatsResponse,
         ContainerSummary, ContainerSummaryStateEnum, PortSummary, PortSummaryTypeEnum,
     };
     use chrono::{DateTime, Duration};
@@ -641,45 +625,47 @@ mod tests {
         ));
     }
 
-    fn stats_sample(
+    fn stats_frame(
         total: u64,
-        pre_total: u64,
         system: u64,
+        pre_total: u64,
         pre_system: u64,
-        online: u32,
-    ) -> ContainerStatsResponse {
-        ContainerStatsResponse {
-            cpu_stats: Some(ContainerCpuStats {
-                cpu_usage: Some(ContainerCpuUsage {
-                    total_usage: Some(total),
-                    ..Default::default()
-                }),
-                system_cpu_usage: Some(system),
-                online_cpus: Some(online),
-                ..Default::default()
-            }),
-            precpu_stats: Some(ContainerCpuStats {
-                cpu_usage: Some(ContainerCpuUsage {
-                    total_usage: Some(pre_total),
-                    ..Default::default()
-                }),
-                system_cpu_usage: Some(pre_system),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    fn memory_sample(
         usage: u64,
-        limit: Option<u64>,
-        stats: &[(&str, u64)],
-    ) -> ContainerStatsResponse {
+        limit: u64,
+        cache_key: Option<(&str, u64)>,
+    ) -> bollard::models::ContainerStatsResponse {
+        use bollard::models::{
+            ContainerCpuStats, ContainerCpuUsage, ContainerMemoryStats, ContainerStatsResponse,
+        };
+        let cpu = ContainerCpuStats {
+            cpu_usage: Some(ContainerCpuUsage {
+                total_usage: Some(total),
+                percpu_usage: Some(vec![total / 4; 4]),
+                ..Default::default()
+            }),
+            system_cpu_usage: Some(system),
+            online_cpus: Some(4),
+            ..Default::default()
+        };
+        let pre = ContainerCpuStats {
+            cpu_usage: Some(ContainerCpuUsage {
+                total_usage: Some(pre_total),
+                percpu_usage: Some(vec![pre_total / 4; 4]),
+                ..Default::default()
+            }),
+            system_cpu_usage: Some(pre_system),
+            online_cpus: Some(4),
+            ..Default::default()
+        };
         ContainerStatsResponse {
+            cpu_stats: Some(cpu),
+            precpu_stats: Some(pre),
             memory_stats: Some(ContainerMemoryStats {
                 usage: Some(usage),
-                limit,
-                stats: Some(stats.iter().map(|(k, v)| (k.to_string(), *v)).collect()),
+                limit: Some(limit),
+                stats: cache_key.map(|(key, value)| {
+                    std::collections::HashMap::from([(key.to_string(), value)])
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -687,78 +673,93 @@ mod tests {
     }
 
     #[test]
-    fn cpu_uses_the_delta_and_the_sample_core_count() {
-        let usage = ContainerUsage::from_sample(&stats_sample(300, 100, 1_300, 500, 2)).unwrap();
-        assert!((usage.cpu_percent.unwrap() - 50.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn zeroed_first_sample_keeps_memory_but_has_no_cpu() {
-        let mut sample = stats_sample(100, 0, 1_000, 0, 8);
-        sample.memory_stats = memory_sample(1_000, None, &[]).memory_stats;
-        let usage = ContainerUsage::from_sample(&sample).unwrap();
-        assert!(usage.cpu_percent.is_none());
-        assert_eq!(usage.memory_usage, Some(1_000));
-        assert_eq!(usage.online_cpus, 8);
-    }
-
-    #[test]
-    fn idle_cpu_is_zero_not_missing() {
-        let usage = ContainerUsage::from_sample(&stats_sample(100, 100, 1_000, 900, 4)).unwrap();
-        assert_eq!(usage.cpu_percent, Some(0.0));
-    }
-
-    #[test]
-    fn memory_prefers_total_inactive_file_then_inactive_file_then_cache() {
-        let v1 = ContainerUsage::from_sample(&memory_sample(
-            1_000,
-            Some(2_000),
-            &[
-                ("total_inactive_file", 200),
-                ("inactive_file", 150),
-                ("cache", 100),
-            ],
-        ))
-        .unwrap();
-        assert_eq!(v1.memory_usage, Some(800));
-        assert_eq!(v1.memory_limit, Some(2_000));
-
-        let v2 = ContainerUsage::from_sample(&memory_sample(
-            1_000,
-            Some(2_000),
-            &[("inactive_file", 300)],
-        ))
-        .unwrap();
-        assert_eq!(v2.memory_usage, Some(700));
-
-        let cache =
-            ContainerUsage::from_sample(&memory_sample(1_000, Some(2_000), &[("cache", 100)]))
-                .unwrap();
-        assert_eq!(cache.memory_usage, Some(900));
-    }
-
-    #[test]
-    fn zero_memory_limit_is_none_and_memory_only_sample_keeps_memory() {
-        let usage = ContainerUsage::from_sample(&memory_sample(1_000, Some(0), &[])).unwrap();
-        assert_eq!(usage.memory_usage, Some(1_000));
-        assert_eq!(usage.memory_limit, None);
-        assert!(usage.cpu_percent.is_none());
-        assert_eq!(usage.online_cpus, 1);
-    }
-
-    #[test]
-    fn formats_usage_numbers() {
-        assert_eq!(format_cpu_percent(0.0), "0.00%");
-        assert_eq!(format_cpu_percent(12.3), "12.30%");
-        assert_eq!(format_usage_bytes(0), "0 B");
-        assert_eq!(format_usage_bytes(1_536), "2 KB");
-        assert_eq!(format_usage_bytes(1_048_576), "1.0 MB");
-        assert_eq!(format_usage_bytes(1_610_612_736), "1.5 GB");
-        assert_eq!(
-            format_memory_pair(196_000_000, Some(2_147_483_648)),
-            "187 MB / 2.0 GB"
+    fn parses_multi_core_cpu_and_cache_adjusted_memory() {
+        let frame = stats_frame(
+            2_000_000_000,
+            8_000_000_000,
+            1_000_000_000,
+            6_000_000_000,
+            300 * 1_048_576,
+            1_024 * 1_048_576,
+            Some(("inactive_file", 50 * 1_048_576)),
         );
-        assert_eq!(format_memory_pair(1_048_576, None), "1.0 MB");
-        assert_eq!(format_memory_pair(1_048_576, Some(0)), "1.0 MB");
+        let stats = ContainerStats::from_response(&frame).unwrap();
+        assert_eq!(stats.online_cpus, 4);
+        let cpu = stats.cpu_percent.unwrap();
+        assert!((cpu - 200.0).abs() < 0.01, "got {cpu}");
+        let memory = stats.memory.unwrap();
+        assert_eq!(memory.used, 250 * 1_048_576);
+        assert_eq!(memory.limit, 1_024 * 1_048_576);
+        assert!((memory.percent.unwrap() - 24.414).abs() < 0.01);
+    }
+
+    #[test]
+    fn first_frame_has_no_cpu_but_keeps_memory() {
+        let frame = stats_frame(
+            2_000_000_000,
+            8_000_000_000,
+            0,
+            0,
+            300 * 1_048_576,
+            1_024 * 1_048_576,
+            Some(("total_inactive_file", 50 * 1_048_576)),
+        );
+        let stats = ContainerStats::from_response(&frame).unwrap();
+        assert!(stats.cpu_percent.is_none(), "zeroed precpu must not be 0%");
+        assert_eq!(stats.memory.unwrap().used, 250 * 1_048_576);
+    }
+
+    #[test]
+    fn formats_cpu_and_memory_labels() {
+        assert_eq!(format_cpu(Some(12.34)).as_deref(), Some("12.3%"));
+        assert_eq!(format_cpu(None), None);
+        let memory = MemoryUsage {
+            used: 432_013_312,
+            limit: 2_147_483_648,
+            percent: Some(20.1),
+        };
+        assert_eq!(
+            format_memory(Some(memory)).as_deref(),
+            Some("412 MB / 2.0 GB")
+        );
+        assert_eq!(
+            format_memory(Some(MemoryUsage { limit: 0, ..memory })).as_deref(),
+            Some("412 MB")
+        );
+        assert_eq!(format_memory(None), None);
+    }
+
+    #[test]
+    fn empty_stats_frame_is_missing() {
+        assert!(ContainerStats::from_response(&Default::default()).is_none());
+    }
+
+    #[test]
+    fn online_cpus_falls_back_to_percpu_then_one() {
+        let mut frame = stats_frame(
+            2_000_000_000,
+            8_000_000_000,
+            1_000_000_000,
+            6_000_000_000,
+            1_048_576,
+            2_097_152,
+            None,
+        );
+        frame.cpu_stats.as_mut().unwrap().online_cpus = None;
+        let stats = ContainerStats::from_response(&frame).unwrap();
+        assert_eq!(stats.online_cpus, 4, "percpu_usage carries four cores");
+
+        let mut memory_only = stats_frame(
+            2_000_000_000,
+            8_000_000_000,
+            1_000_000_000,
+            6_000_000_000,
+            1_048_576,
+            2_097_152,
+            None,
+        );
+        memory_only.cpu_stats = None;
+        let stats = ContainerStats::from_response(&memory_only).unwrap();
+        assert_eq!(stats.online_cpus, 1);
     }
 }

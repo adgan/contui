@@ -22,11 +22,28 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       VERSION: ${{ inputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/v${{ inputs.version }}
-      - name: Check tag matches Cargo.toml
-        run: grep -qx "version = \"$VERSION\"" Cargo.toml
+          fetch-depth: 0
+      - name: Check the tag matches the app's version strings
+        run: |
+          grep -qx "version = \"$VERSION\"" Cargo.toml
+          grep -A1 'CFBundleShortVersionString' assets/Info.plist | grep -q "<string>$VERSION</string>"
+      - name: Refuse to overwrite a published release
+        run: |
+          # A bottle build is not reproducible. Re-publishing the same version replaces
+          # the asset under the sha the tap already pins, and every install then fails
+          # its checksum on a green run. Cut a new version instead.
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            assets=$(gh release view "v$VERSION" --json assets -q '.assets | length')
+            if [ "$assets" != "0" ]; then
+              echo "v$VERSION already has $assets assets; refusing to overwrite. Cut a new version." >&2
+              exit 1
+            fi
+          fi
+      - name: Test the formula generator
+        run: tests/release/generate_formula_test.sh
       - name: Create the release
         run: |
           if gh release view "v$VERSION" >/dev/null 2>&1; then exit 0; fi
@@ -39,8 +56,8 @@ jobs:
       - name: Build source tarball and stable formula
         run: scripts/prepare-release.sh "$VERSION" dist
       - name: Publish source tarball
-        run: gh release upload "v$VERSION" dist/contui-*.tar.gz --clobber
-      - uses: actions/upload-artifact@v4
+        run: gh release upload "v$VERSION" dist/contui-*.tar.gz
+      - uses: actions/upload-artifact@v7
         with:
           name: formula-base
           path: dist/contui.rb
@@ -58,21 +75,30 @@ jobs:
       HOMEBREW_NO_ANALYTICS: 1
       HOMEBREW_NO_ENV_HINTS: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/v${{ inputs.version }}
           sparse-checkout: scripts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: formula-base
           path: dist
+      - name: Fetch the published source tarball
+        # check-artifacts.sh holds the tarball and the bottle against each other, and the
+        # tarball only exists as a release asset. Without it the check fails on its first
+        # assertion, long before it can say anything about the bundle.
+        run: gh release download "v$VERSION" --pattern "contui-*.tar.gz" --dir dist
       - name: Build bottle
         run: scripts/build-bottle.sh "$VERSION" dist
+      - name: Check the artifacts a user actually gets
+        run: scripts/check-artifacts.sh "$VERSION" dist
       - name: Publish bottle
-        run: gh release upload "v$VERSION" dist/*.bottle.tar.gz --clobber
+        run: gh release upload "v$VERSION" dist/*.bottle.tar.gz
       - name: Publish formula for the tap
-        run: cat dist/contui.rb >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+        run: |
+          # The summary is markdown; unfenced Ruby loses its comments and indentation.
+          { echo '```ruby'; cat dist/contui.rb; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
         with:
           name: formula
           path: dist/contui.rb

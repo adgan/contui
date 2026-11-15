@@ -39,8 +39,8 @@ fn wait_for(
             | Response::PullProgress { .. }
             | Response::Inspect { .. }
             | Response::Logs { .. }
-            | Response::Usage { .. }
-            | Response::UsageStale { .. } => continue,
+            | Response::Stats { .. }
+            | Response::StatsStale { .. } => continue,
             _ => {}
         }
         panic!("while waiting for {what}, got {response:?}");
@@ -391,18 +391,21 @@ fn stats_stream_reports_live_usage_for_a_running_container() {
     let _ = wait_for(&responses, "snapshot for stats", |response| {
         matches!(response, Response::Snapshot(_))
     });
-    let usage = wait_for(&responses, "container usage", |response| {
+    service.request(Request::WatchStats {
+        ids: vec![id.clone()],
+    });
+    let stats = wait_for(&responses, "container stats", |response| {
         matches!(
             response,
-            Response::Usage { usage, .. }
-                if usage.cpu_percent.is_some() && usage.memory_usage.is_some()
+            Response::Stats { stats, .. }
+                if stats.cpu_percent.is_some() && stats.memory.is_some()
         )
     });
-    match usage {
-        Response::Usage { usage, .. } => {
-            assert!(usage.cpu_percent.unwrap() >= 0.0);
+    match stats {
+        Response::Stats { stats, .. } => {
+            assert!(stats.cpu_percent.unwrap() >= 0.0);
             assert!(
-                usage.memory_usage.unwrap() > 0,
+                stats.memory.unwrap().used > 0,
                 "expected a non-zero memory working set"
             );
         }

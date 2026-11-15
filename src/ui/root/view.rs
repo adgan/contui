@@ -6,11 +6,13 @@ use crate::ui::detail::{DetailTab, render_logs};
 use crate::ui::inspect::InspectNode;
 use crate::ui::mutations::RowMenuState;
 use crate::ui::style::Layout;
-use crate::ui::table::{CellStyle, ColumnWidth};
+use crate::ui::table::{CellStyle, ColumnWidth, cell_wraps};
 use crate::ui::usage::DetailUsage;
 use crate::ui::widgets::button::{ButtonSpec, button};
 use crate::ui::widgets::pill::{state_pill, state_pill_inline};
+use crate::ui::widgets::tooltip::CellTooltip;
 use crate::ui::widgets::stat_card::{StatCard, stat_card};
+use crate::ui::widgets::usage_meter::{memory_color, usage_meter};
 use gpui::{
     AnyElement, Context, Div, FontWeight, IntoElement, MouseButton, Render, SharedString, Window,
     div, px, svg, uniform_list,
@@ -178,6 +180,18 @@ impl RootView {
             cx,
             move |this, _cx| {
                 this.open_detail_by_id(menu_kind, &menu_id);
+                this.mutations.row_menu = None;
+            },
+        ));
+
+        let copy_title = title.clone();
+        panel = panel.child(row_menu_item(
+            "Copy name",
+            theme.text_dim,
+            &theme,
+            cx,
+            move |this, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_title.clone()));
                 this.mutations.row_menu = None;
             },
         ));
@@ -368,7 +382,7 @@ impl RootView {
         let detail_usage = if detail.kind == ResourceKind::Container {
             let connected = matches!(&self.status, HostStatus::Connected);
             Some(DetailUsage::from(
-                self.usage.get(&detail.id),
+                self.container_stats.get(&detail.id),
                 state.unwrap_or(ContainerState::Unknown),
                 connected,
             ))
@@ -1517,7 +1531,7 @@ impl RootView {
         let stats = self.stats.clone();
         let loading = stats.is_loading();
         let page = self.page;
-        let usage_totals = UsageTotals::from_snapshot(&self.snapshot, &self.usage);
+        let usage_totals = UsageTotals::from_snapshot(&self.snapshot, &self.container_stats);
         let usage_labels = UsageCardLabels::from(
             &usage_totals,
             self.snapshot.fetched_at.is_some(),
@@ -1999,7 +2013,51 @@ impl RootView {
                             continue;
                         }
 
-                        let mut text = div().map_width(width).truncate().child(cell.clone());
+                        if matches!(style, CellStyle::Cpu | CellStyle::Memory) {
+                            let stats = this.container_stats.get(&row_id).copied();
+                            let (fraction, color) = match style {
+                                CellStyle::Cpu => (
+                                    stats.and_then(|stats| stats.cpu_percent).map(|p| p / 100.0),
+                                    theme.accent,
+                                ),
+                                _ => {
+                                    let percent =
+                                        stats.and_then(|stats| stats.memory).and_then(|m| m.percent);
+                                    (
+                                        percent.map(|p| p / 100.0),
+                                        memory_color(percent, &theme),
+                                    )
+                                }
+                            };
+                            element = element.child(
+                                div()
+                                    .map_width(width)
+                                    .h_full()
+                                    .flex()
+                                    .flex_col()
+                                    .justify_center()
+                                    .child(usage_meter(cell.as_ref(), fraction, color, &theme)),
+                            );
+                            continue;
+                        }
+
+                        let mut text = div()
+                            .id(SharedString::from(format!("cell-{row_id}-{column}")))
+                            .map_width(width);
+                        if cell_wraps(column, style) {
+                            let full = cell.to_string();
+                            let tip_theme = theme.clone();
+                            text = text.hoverable_tooltip(move |_window, cx| -> gpui::AnyView {
+                                cx.new(|_cx| {
+                                    CellTooltip::new(full.clone().into(), tip_theme.clone())
+                                })
+                                .into()
+                            });
+                            text = text.line_clamp(2).text_ellipsis();
+                        } else {
+                            text = text.truncate();
+                        }
+                        text = text.child(cell.clone());
                         match style {
                             CellStyle::Text => {
                                 text = text
@@ -2019,6 +2077,7 @@ impl RootView {
                                     .line_height(px(16.))
                                     .text_color(theme.text_dim);
                             }
+                            CellStyle::Cpu | CellStyle::Memory => {}
                             CellStyle::Timestamp => {
                                 text = text
                                     .text_size(px(11.))
@@ -2146,9 +2205,14 @@ impl RootView {
 
 trait MapWidth: Styled + Sized {
     fn map_width(self, width: ColumnWidth) -> Self {
-        match width {
-            ColumnWidth::Fixed(value) => self.w(px(value)).flex_shrink_0(),
-            ColumnWidth::Flex(_weight) => self.flex_grow().min_w(px(0.)),
+        let layout = crate::ui::table::column_layout(width);
+        match layout.fixed {
+            Some(value) => self.w(px(value)).flex_shrink_0(),
+            None => {
+                let mut styled = self.min_w(px(0.)).flex_basis(px(0.));
+                styled.style().flex_grow = Some(layout.grow);
+                styled
+            }
         }
     }
 }
@@ -2183,7 +2247,7 @@ fn action_enabled(state: Option<ContainerState>, kind: ResourceKind, action: Act
 }
 
 /// Height of the blank band that separates one grouped section from the next.
-/// It is part of the 44px header so `uniform_list` keeps a single row height.
+/// It is part of the 52px header so `uniform_list` keeps a single row height.
 const SECTION_GAP: f32 = 12.0;
 
 fn group_header(
@@ -2788,5 +2852,77 @@ impl Render for RootView {
         }
 
         root
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn row(name: &'static str, tag: &'static str) -> Div {
+        div()
+            .w(px(700.))
+            .flex()
+            .items_center()
+            .child(div().map_width(ColumnWidth::Flex(2.2)).child(name))
+            .child(
+                div()
+                    .map_width(ColumnWidth::Fixed(104.))
+                    .debug_selector(move || format!("{tag}-state"))
+                    .child("running"),
+            )
+            .child(div().map_width(ColumnWidth::Flex(2.0)).child("postgres:18"))
+    }
+
+    struct Rows;
+
+    impl Render for Rows {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().flex().flex_col().child(row("short", "short")).child(row(
+                "k8s_helm_helm-install-traefik-crd-4l4f2_kube-system_aaaaaaaaaaaaaaaaaaaa",
+                "long",
+            ))
+        }
+    }
+
+    #[gpui::test]
+    fn columns_do_not_depend_on_the_cell_text(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_window, _cx| Rows);
+        cx.run_until_parked();
+
+        let short = cx.debug_bounds("short-state").expect("short row laid out");
+        let long = cx.debug_bounds("long-state").expect("long row laid out");
+        let drift = (f32::from(short.origin.x) - f32::from(long.origin.x)).abs();
+        assert!(drift < 0.5, "state column drifted by {drift}px with content");
+    }
+
+    struct Clamped;
+
+    impl Render for Clamped {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(120.)).flex().child(
+                div()
+                    .line_clamp(2)
+                    .text_ellipsis()
+                    .text_size(px(13.))
+                    .line_height(px(18.))
+                    .debug_selector(|| "clamped".to_string())
+                    .child("k8s_helm_helm-install-traefik-crd-4l4f2_kube-system_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_long_first_column_takes_two_lines(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_window, _cx| Clamped);
+        cx.run_until_parked();
+
+        let bounds = cx.debug_bounds("clamped").expect("clamped cell laid out");
+        let height = f32::from(bounds.size.height);
+        assert!(
+            (height - 36.0).abs() < 1.0,
+            "expected two 18px lines, got {height}px"
+        );
     }
 }

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="187 187 650 650" role="img" aria-label="contUI">
+  <!-- Mark only: transparent background, single accent from src/theme.rs.
+       Use on the app's dark surface or anywhere a compact glyph is needed. -->
+  <g fill="none" stroke="#2f7bf6" stroke-width="44" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M512 209 L777 362 L512 515 L247 362 Z"/>
+    <path d="M247 362 L512 515 L512 815 L247 662 Z"/>
+    <path d="M512 515 L777 362 L777 662 L512 815 Z"/>
+  </g>
+  <circle cx="512" cy="392" r="46" fill="#3fb950"/>
+</svg>

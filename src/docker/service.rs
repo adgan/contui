@@ -1,16 +1,17 @@
 use crate::docker::actions::{
-    ActionKind, ContainerAction, RunSpec, Target, classify_run_error, clean_error, run_body,
-    split_image_reference,
+    classify_run_error, clean_error, run_body, split_image_reference, ActionKind, ContainerAction,
+    RunSpec, Target,
 };
-use crate::docker::endpoint::{EndpointKind, HostInfo, HostStatus, TlsFiles, discover};
+use crate::docker::endpoint::{
+    discover, EndpointKind, HostInfo, HostStatus, TlsFiles,
+};
 use crate::docker::events::Debouncer;
 use crate::docker::model::{
-    ContainerRow, ContainerState, ContainerUsage, ImageRow, LogLine, ResourceKind, Snapshot,
-    VolumeRow, parse_logs, status_from_error,
+    parse_logs, status_from_error, ContainerRow, ContainerStats, ImageRow, LogLine, ResourceKind,
+    Snapshot, VolumeRow,
 };
 use async_channel::{Receiver, Sender};
 use bollard::Docker;
-use bollard::models::ContainerStatsResponse;
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, CreateImageOptionsBuilder,
     ListContainersOptionsBuilder, ListImagesOptionsBuilder, ListVolumesOptionsBuilder,
@@ -19,7 +20,7 @@ use bollard::query_parameters::{
     StopContainerOptions, StopContainerOptionsBuilder,
 };
 use chrono::Utc;
-use futures_util::{StreamExt, join};
+use futures_util::{join, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -76,6 +77,10 @@ pub enum Request {
         spec: RunSpec,
         epoch: u64,
     },
+    /// The exact set of containers whose stats the UI can currently show.
+    WatchStats {
+        ids: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -91,13 +96,6 @@ pub enum Response {
     Logs {
         id: String,
         lines: Vec<LogLine>,
-    },
-    Usage {
-        id: String,
-        usage: ContainerUsage,
-    },
-    UsageStale {
-        id: String,
     },
     Dirty {
         ids: Vec<(ResourceKind, String)>,
@@ -137,6 +135,14 @@ pub enum Response {
         created: Option<String>,
         epoch: u64,
     },
+    Stats {
+        id: String,
+        stats: ContainerStats,
+    },
+    /// The stream stalled or errored; the last reading is no longer live.
+    StatsStale {
+        id: String,
+    },
 }
 
 pub fn remove_container_options(force: bool) -> RemoveContainerOptions {
@@ -148,6 +154,37 @@ pub fn remove_container_options(force: bool) -> RemoveContainerOptions {
 
 pub fn stop_options() -> StopContainerOptions {
     StopContainerOptionsBuilder::new().t(10).build()
+}
+
+/// Docker's stats stream emits once a second; the UI only needs a reading
+/// every two. The stream stays open either way.
+const STATS_UI_INTERVAL: Duration = Duration::from_secs(2);
+
+pub fn stats_options() -> bollard::query_parameters::StatsOptions {
+    StatsOptionsBuilder::new().stream(true).one_shot(false).build()
+}
+
+fn stats_sample_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_none_or(|last| now.duration_since(last) >= STATS_UI_INTERVAL)
+}
+
+/// A live stream should emit every second. Five seconds of silence means the
+/// connection is wedged, so the reading is dropped rather than left frozen.
+const STATS_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn next_sample<S>(
+    stream: &mut S,
+    timeout: Duration,
+) -> Option<Result<bollard::models::ContainerStatsResponse, bollard::errors::Error>>
+where
+    S: futures_util::Stream<
+            Item = Result<bollard::models::ContainerStatsResponse, bollard::errors::Error>,
+        > + Unpin,
+{
+    tokio::time::timeout(timeout, stream.next())
+        .await
+        .ok()
+        .flatten()
 }
 
 pub fn pull_options(reference: &str) -> CreateImageOptions {
@@ -196,19 +233,19 @@ impl DockerService {
 
 impl Drop for DockerService {
     fn drop(&mut self) {
-        self.runtime.take();
+        if let Some(runtime) = self.runtime.take() {
+            // Cancels the actor, the event loop and every stats stream. The
+            // timeout bounds a host switch or quit when a stream is stuck.
+            runtime.shutdown_timeout(Duration::from_millis(500));
+        }
     }
 }
 
 fn build_docker(host: &HostInfo) -> Result<Docker, String> {
     let version = bollard::API_DEFAULT_VERSION;
     match host.endpoint.kind {
-        EndpointKind::Unix => {
-            Docker::connect_with_unix(&host.endpoint.address, CLIENT_TIMEOUT_SECS, version)
-        }
-        EndpointKind::Http => {
-            Docker::connect_with_http(&host.endpoint.address, CLIENT_TIMEOUT_SECS, version)
-        }
+        EndpointKind::Unix => Docker::connect_with_unix(&host.endpoint.address, CLIENT_TIMEOUT_SECS, version),
+        EndpointKind::Http => Docker::connect_with_http(&host.endpoint.address, CLIENT_TIMEOUT_SECS, version),
         EndpointKind::Tls => {
             let tls = host
                 .tls
@@ -283,113 +320,6 @@ async fn send_run_failed(
         .await;
 }
 
-fn running_container_ids(snapshot: &Snapshot) -> HashSet<String> {
-    snapshot
-        .containers
-        .iter()
-        .filter(|container| container.state == ContainerState::Running)
-        .map(|container| container.id.clone())
-        .collect()
-}
-
-/// The difference between the containers that should have a stream and the
-/// tasks that currently have one. Both lists are sorted so the reconciliation
-/// is deterministic.
-fn stats_plan(running: &HashSet<String>, active: &HashSet<String>) -> (Vec<String>, Vec<String>) {
-    let mut start: Vec<String> = running.difference(active).cloned().collect();
-    let mut stop: Vec<String> = active.difference(running).cloned().collect();
-    start.sort();
-    stop.sort();
-    (start, stop)
-}
-
-async fn next_sample<S>(
-    stream: &mut S,
-    timeout: Duration,
-) -> Option<Result<ContainerStatsResponse, bollard::errors::Error>>
-where
-    S: futures_util::Stream<Item = Result<ContainerStatsResponse, bollard::errors::Error>> + Unpin,
-{
-    tokio::time::timeout(timeout, stream.next())
-        .await
-        .ok()
-        .flatten()
-}
-
-/// One long-lived stream per running container. The actor aborts this task when
-/// the container stops; errors and stalls retry with backoff and tell the UI to
-/// drop the last sample so a frozen number never looks live.
-async fn stats_loop(docker: Docker, id: String, resp_tx: Sender<Response>) {
-    let mut backoff_secs = 1u64;
-
-    loop {
-        let mut stream =
-            Box::pin(docker.stats(&id, Some(StatsOptionsBuilder::new().stream(true).build())));
-
-        loop {
-            match next_sample(&mut stream, Duration::from_secs(5)).await {
-                Some(Ok(sample)) => {
-                    if let Some(usage) = ContainerUsage::from_sample(&sample) {
-                        if resp_tx
-                            .send(Response::Usage {
-                                id: id.clone(),
-                                usage,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        backoff_secs = 1;
-                    }
-                }
-                Some(Err(_)) | None => break,
-            }
-        }
-
-        if resp_tx
-            .send(Response::UsageStale { id: id.clone() })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-        backoff_secs = (backoff_secs * 2).min(10);
-    }
-}
-
-fn reconcile_stats(
-    docker: &Docker,
-    resp_tx: &Sender<Response>,
-    tasks: &mut HashMap<String, JoinHandle<()>>,
-    running: &HashSet<String>,
-) {
-    tasks.retain(|_, handle| {
-        if handle.is_finished() {
-            handle.abort();
-            false
-        } else {
-            true
-        }
-    });
-
-    let active: HashSet<String> = tasks.keys().cloned().collect();
-    let (start, stop) = stats_plan(running, &active);
-
-    for id in stop {
-        if let Some(handle) = tasks.remove(&id) {
-            handle.abort();
-        }
-    }
-    for id in start {
-        tasks.insert(
-            id.clone(),
-            tokio::spawn(stats_loop(docker.clone(), id, resp_tx.clone())),
-        );
-    }
-}
-
 async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Response>) {
     let status = match tokio::time::timeout(Duration::from_secs(3), docker.ping()).await {
         Ok(Ok(_)) => HostStatus::Connected,
@@ -404,14 +334,10 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
         match req {
             Request::FetchAll => match fetch_all(&docker).await {
                 Ok(snapshot) => {
-                    let running = running_container_ids(&snapshot);
                     let _ = resp_tx.send(Response::Snapshot(snapshot)).await;
-                    reconcile_stats(&docker, &resp_tx, &mut stats_tasks, &running);
                 }
                 Err(err) => {
-                    let _ = resp_tx
-                        .send(Response::Status(status_from_error(&err)))
-                        .await;
+                    let _ = resp_tx.send(Response::Status(status_from_error(&err))).await;
                     let _ = resp_tx
                         .send(Response::Failed {
                             what: "fetch".to_string(),
@@ -424,9 +350,28 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                 let statuses = probe_hosts().await;
                 let _ = resp_tx.send(Response::HostStatuses(statuses)).await;
             }
+            Request::WatchStats { ids } => {
+                let desired: HashSet<String> = ids.into_iter().collect();
+                stats_tasks.retain(|id, handle| {
+                    let keep = desired.contains(id) && !handle.is_finished();
+                    if !keep {
+                        handle.abort();
+                    }
+                    keep
+                });
+                for id in desired {
+                    if stats_tasks.contains_key(&id) {
+                        continue;
+                    }
+                    let task = tokio::spawn(stats_task(docker.clone(), id.clone(), resp_tx.clone()));
+                    stats_tasks.insert(id, task);
+                }
+            }
             Request::Inspect { kind, id } => match inspect(&docker, kind, &id).await {
                 Ok(json) => {
-                    let _ = resp_tx.send(Response::Inspect { kind, id, json }).await;
+                    let _ = resp_tx
+                        .send(Response::Inspect { kind, id, json })
+                        .await;
                 }
                 Err(err) => {
                     let _ = resp_tx
@@ -492,10 +437,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                         .force(force)
                         .noprune(false)
                         .build();
-                    docker
-                        .remove_image(&id, Some(options), None)
-                        .await
-                        .map(|_| ())
+                    docker.remove_image(&id, Some(options), None).await.map(|_| ())
                 };
                 spawn_mutation(resp_tx.clone(), target, ActionKind::Remove, epoch, call);
             }
@@ -511,11 +453,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                 };
                 spawn_mutation(resp_tx.clone(), target, ActionKind::Remove, epoch, call);
             }
-            Request::PullImage {
-                reference,
-                origin,
-                epoch,
-            } => {
+            Request::PullImage { reference, origin, epoch } => {
                 let docker = docker.clone();
                 let resp_tx = resp_tx.clone();
                 tokio::spawn(async move {
@@ -562,10 +500,9 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                 let docker = docker.clone();
                 let resp_tx = resp_tx.clone();
                 tokio::spawn(async move {
-                    let options = spec
-                        .name
-                        .as_deref()
-                        .map(|name| CreateContainerOptionsBuilder::new().name(name).build());
+                    let options = spec.name.as_deref().map(|name| {
+                        CreateContainerOptionsBuilder::new().name(name).build()
+                    });
                     let body = run_body(&spec);
                     let created = match tokio::time::timeout(
                         Duration::from_secs(30),
@@ -609,11 +546,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                     {
                         Ok(Ok(())) => {
                             let _ = resp_tx
-                                .send(Response::ContainerCreated {
-                                    id,
-                                    warnings,
-                                    epoch,
-                                })
+                                .send(Response::ContainerCreated { id, warnings, epoch })
                                 .await;
                         }
                         Ok(Err(err)) => {
@@ -641,6 +574,54 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                 });
             }
         }
+    }
+}
+
+/// One stats stream per watched container. Docker sends a frame per second;
+/// only every other usable frame reaches the UI. A broken or stalled stream
+/// tells the UI to drop its last reading, then retries with backoff until the
+/// actor aborts the task.
+async fn stats_task(docker: Docker, id: String, resp_tx: Sender<Response>) {
+    let mut backoff_secs: u64 = 1;
+    loop {
+        let mut stream = Box::pin(docker.stats(&id, Some(stats_options())));
+        let mut last_sent: Option<std::time::Instant> = None;
+        loop {
+            let Some(item) = next_sample(&mut stream, STATS_STALL_TIMEOUT).await else {
+                break;
+            };
+            let Ok(frame) = item else {
+                break;
+            };
+            let Some(stats) = ContainerStats::from_response(&frame) else {
+                continue;
+            };
+            let now = std::time::Instant::now();
+            if !stats_sample_due(last_sent, now) {
+                continue;
+            }
+            if resp_tx
+                .send(Response::Stats {
+                    id: id.clone(),
+                    stats,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            last_sent = Some(now);
+            backoff_secs = 1;
+        }
+        if resp_tx
+            .send(Response::StatsStale { id: id.clone() })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(5);
     }
 }
 
@@ -694,13 +675,16 @@ async fn inspect(
     id: &str,
 ) -> Result<serde_json::Value, bollard::errors::Error> {
     let value = match kind {
-        ResourceKind::Container => serde_json::to_value(docker.inspect_container(id, None).await?)
-            .unwrap_or(serde_json::Value::Null),
+        ResourceKind::Container => {
+            serde_json::to_value(docker.inspect_container(id, None).await?)
+                .unwrap_or(serde_json::Value::Null)
+        }
         ResourceKind::Image => {
             serde_json::to_value(docker.inspect_image(id).await?).unwrap_or(serde_json::Value::Null)
         }
-        ResourceKind::Volume => serde_json::to_value(docker.inspect_volume(id).await?)
-            .unwrap_or(serde_json::Value::Null),
+        ResourceKind::Volume => {
+            serde_json::to_value(docker.inspect_volume(id).await?).unwrap_or(serde_json::Value::Null)
+        }
     };
     Ok(value)
 }
@@ -754,6 +738,7 @@ async fn probe_one(host: &HostInfo) -> HostStatus {
         Err(_) => HostStatus::Unreachable("timed out after 300ms".to_string()),
     }
 }
+
 
 /// Subscribes to `/events` and pushes debounced dirty notifications into the UI.
 /// The daemon restarting ends the stream; we mark the host unreachable and
@@ -854,53 +839,32 @@ mod tests {
         }
     }
 
-    fn container(id: &str, state: ContainerState) -> ContainerRow {
-        ContainerRow {
-            id: id.to_string(),
-            name: gpui::SharedString::from(id.to_string()),
-            state,
-            status: gpui::SharedString::from("Up"),
-            image: gpui::SharedString::from("alpine:3.20"),
-            ports: gpui::SharedString::from("—"),
-            created: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
-            created_label: gpui::SharedString::from("2m ago"),
-            compose_project: None,
-        }
+    #[test]
+    fn stats_options_stream_and_do_not_one_shot() {
+        let options = stats_options();
+        assert!(options.stream);
+        assert!(!options.one_shot);
     }
 
     #[test]
-    fn running_ids_exclude_paused_and_restarting() {
-        let snapshot = Snapshot {
-            containers: vec![
-                container("a", ContainerState::Running),
-                container("b", ContainerState::Paused),
-                container("c", ContainerState::Restarting),
-                container("d", ContainerState::Exited),
-            ],
-            ..Snapshot::empty()
-        };
-        assert_eq!(
-            running_container_ids(&snapshot),
-            HashSet::from(["a".to_string()])
-        );
-    }
-
-    #[test]
-    fn stats_plan_starts_new_ids_and_stops_gone_ids() {
-        let running = HashSet::from(["a".to_string(), "b".to_string()]);
-        let active = HashSet::from(["b".to_string(), "c".to_string()]);
-        assert_eq!(
-            stats_plan(&running, &active),
-            (vec!["a".to_string()], vec!["c".to_string()])
-        );
+    fn stats_ui_samples_wait_two_seconds() {
+        let now = std::time::Instant::now();
+        assert!(stats_sample_due(None, now));
+        assert!(!stats_sample_due(
+            Some(now),
+            now + std::time::Duration::from_millis(1_999)
+        ));
+        assert!(stats_sample_due(
+            Some(now),
+            now + std::time::Duration::from_secs(2)
+        ));
     }
 
     #[test]
     fn next_sample_returns_none_when_the_stream_stalls() {
-        use bollard::models::ContainerStatsResponse;
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let mut stream = futures_util::stream::pending::<
-            Result<ContainerStatsResponse, bollard::errors::Error>,
+            Result<bollard::models::ContainerStatsResponse, bollard::errors::Error>,
         >();
         let sample = runtime.block_on(next_sample(&mut stream, Duration::from_millis(1)));
         assert!(sample.is_none());
