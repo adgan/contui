@@ -1,8 +1,8 @@
 use crate::docker::endpoint::HostStatus;
 use bollard::container::LogOutput;
 use bollard::models::{
-    ContainerMemoryStats, ContainerStatsResponse, ContainerSummary, ContainerSummaryStateEnum,
-    ImageSummary, PortSummary, Volume,
+    ContainerCpuStats, ContainerMemoryStats, ContainerStatsResponse, ContainerSummary,
+    ContainerSummaryStateEnum, ImageSummary, PortSummary, Volume,
 };
 use chrono::{DateTime, Utc};
 use gpui::SharedString;
@@ -150,17 +150,38 @@ pub struct MemoryUsage {
 pub struct ContainerStats {
     pub cpu_percent: Option<f32>,
     pub memory: Option<MemoryUsage>,
+    /// The core count that produced `cpu_percent`, kept with the sample so host
+    /// totals can normalize each container independently.
+    pub online_cpus: u32,
 }
 
 impl ContainerStats {
     pub fn from_response(response: &ContainerStatsResponse) -> Option<Self> {
         let cpu_percent = cpu_percent(response);
         let memory = response.memory_stats.as_ref().and_then(memory_usage);
+        let online_cpus = response
+            .cpu_stats
+            .as_ref()
+            .map(online_cpus)
+            .unwrap_or(1);
         (cpu_percent.is_some() || memory.is_some()).then_some(Self {
             cpu_percent,
             memory,
+            online_cpus,
         })
     }
+}
+
+fn online_cpus(cpu: &ContainerCpuStats) -> u32 {
+    cpu.online_cpus
+        .or_else(|| {
+            cpu.cpu_usage
+                .as_ref()
+                .and_then(|usage| usage.percpu_usage.as_ref())
+                .map(|cores| cores.len() as u32)
+        })
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// Docker's formula: the container's CPU-time delta over the host's CPU-time
@@ -178,16 +199,7 @@ fn cpu_percent(response: &ContainerStatsResponse) -> Option<f32> {
     }
     let cpu_delta = total.saturating_sub(previous_total) as f64;
     let system_delta = (system - previous_system) as f64;
-    let cores = cpu
-        .online_cpus
-        .or_else(|| {
-            cpu.cpu_usage
-                .as_ref()
-                .and_then(|usage| usage.percpu_usage.as_ref())
-                .map(|cores| cores.len() as u32)
-        })
-        .unwrap_or(1)
-        .max(1);
+    let cores = online_cpus(cpu);
     Some(((cpu_delta / system_delta) * cores as f64 * 100.0).max(0.0) as f32)
 }
 
@@ -672,6 +684,7 @@ mod tests {
             Some(("inactive_file", 50 * 1_048_576)),
         );
         let stats = ContainerStats::from_response(&frame).unwrap();
+        assert_eq!(stats.online_cpus, 4);
         let cpu = stats.cpu_percent.unwrap();
         assert!((cpu - 200.0).abs() < 0.01, "got {cpu}");
         let memory = stats.memory.unwrap();
@@ -719,5 +732,34 @@ mod tests {
     #[test]
     fn empty_stats_frame_is_missing() {
         assert!(ContainerStats::from_response(&Default::default()).is_none());
+    }
+
+    #[test]
+    fn online_cpus_falls_back_to_percpu_then_one() {
+        let mut frame = stats_frame(
+            2_000_000_000,
+            8_000_000_000,
+            1_000_000_000,
+            6_000_000_000,
+            1_048_576,
+            2_097_152,
+            None,
+        );
+        frame.cpu_stats.as_mut().unwrap().online_cpus = None;
+        let stats = ContainerStats::from_response(&frame).unwrap();
+        assert_eq!(stats.online_cpus, 4, "percpu_usage carries four cores");
+
+        let mut memory_only = stats_frame(
+            2_000_000_000,
+            8_000_000_000,
+            1_000_000_000,
+            6_000_000_000,
+            1_048_576,
+            2_097_152,
+            None,
+        );
+        memory_only.cpu_stats = None;
+        let stats = ContainerStats::from_response(&memory_only).unwrap();
+        assert_eq!(stats.online_cpus, 1);
     }
 }

@@ -378,6 +378,7 @@ mod tests {
                     limit: 2_147_483_648,
                     percent: Some(20.1),
                 }),
+                online_cpus: 1,
             },
         )]);
         let table = containers_table(&snapshot, &stats);
@@ -415,6 +416,7 @@ mod tests {
                     limit: 0,
                     percent: None,
                 }),
+                online_cpus: 1,
             },
         )]);
         let table = containers_table(&snapshot, &stats);

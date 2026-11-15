@@ -139,6 +139,10 @@ pub enum Response {
         id: String,
         stats: ContainerStats,
     },
+    /// The stream stalled or errored; the last reading is no longer live.
+    StatsStale {
+        id: String,
+    },
 }
 
 pub fn remove_container_options(force: bool) -> RemoveContainerOptions {
@@ -162,6 +166,25 @@ pub fn stats_options() -> bollard::query_parameters::StatsOptions {
 
 fn stats_sample_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     last.is_none_or(|last| now.duration_since(last) >= STATS_UI_INTERVAL)
+}
+
+/// A live stream should emit every second. Five seconds of silence means the
+/// connection is wedged, so the reading is dropped rather than left frozen.
+const STATS_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn next_sample<S>(
+    stream: &mut S,
+    timeout: Duration,
+) -> Option<Result<bollard::models::ContainerStatsResponse, bollard::errors::Error>>
+where
+    S: futures_util::Stream<
+            Item = Result<bollard::models::ContainerStatsResponse, bollard::errors::Error>,
+        > + Unpin,
+{
+    tokio::time::timeout(timeout, stream.next())
+        .await
+        .ok()
+        .flatten()
 }
 
 pub fn pull_options(reference: &str) -> CreateImageOptions {
@@ -555,17 +578,20 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
 }
 
 /// One stats stream per watched container. Docker sends a frame per second;
-/// only every other usable frame reaches the UI. A broken stream is retried
-/// with backoff and only stops when the actor aborts the task.
+/// only every other usable frame reaches the UI. A broken or stalled stream
+/// tells the UI to drop its last reading, then retries with backoff until the
+/// actor aborts the task.
 async fn stats_task(docker: Docker, id: String, resp_tx: Sender<Response>) {
     let mut backoff_secs: u64 = 1;
     loop {
         let mut stream = Box::pin(docker.stats(&id, Some(stats_options())));
         let mut last_sent: Option<std::time::Instant> = None;
-        while let Some(item) = stream.next().await {
-            let frame = match item {
-                Ok(frame) => frame,
-                Err(_) => break,
+        loop {
+            let Some(item) = next_sample(&mut stream, STATS_STALL_TIMEOUT).await else {
+                break;
+            };
+            let Ok(frame) = item else {
+                break;
             };
             let Some(stats) = ContainerStats::from_response(&frame) else {
                 continue;
@@ -585,6 +611,14 @@ async fn stats_task(docker: Docker, id: String, resp_tx: Sender<Response>) {
                 return;
             }
             last_sent = Some(now);
+            backoff_secs = 1;
+        }
+        if resp_tx
+            .send(Response::StatsStale { id: id.clone() })
+            .await
+            .is_err()
+        {
+            return;
         }
         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(5);
@@ -824,5 +858,15 @@ mod tests {
             Some(now),
             now + std::time::Duration::from_secs(2)
         ));
+    }
+
+    #[test]
+    fn next_sample_returns_none_when_the_stream_stalls() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut stream = futures_util::stream::pending::<
+            Result<bollard::models::ContainerStatsResponse, bollard::errors::Error>,
+        >();
+        let sample = runtime.block_on(next_sample(&mut stream, Duration::from_millis(1)));
+        assert!(sample.is_none());
     }
 }

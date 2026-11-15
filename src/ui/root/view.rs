@@ -1,14 +1,13 @@
 use super::*;
 use crate::docker::actions::{ActionKind, container_actions};
-use crate::docker::model::{
-    ContainerState, ResourceKind, format_bytes, format_cpu, format_memory,
-};
+use crate::docker::model::{ContainerState, ResourceKind, format_bytes};
 use crate::theme::Theme;
 use crate::ui::detail::{DetailTab, render_logs};
 use crate::ui::inspect::InspectNode;
 use crate::ui::mutations::RowMenuState;
 use crate::ui::style::Layout;
 use crate::ui::table::{CellStyle, ColumnWidth, cell_wraps};
+use crate::ui::usage::DetailUsage;
 use crate::ui::widgets::button::{ButtonSpec, button};
 use crate::ui::widgets::pill::{state_pill, state_pill_inline};
 use crate::ui::widgets::tooltip::CellTooltip;
@@ -380,6 +379,16 @@ impl RootView {
             None
         };
         let state = container.as_ref().map(|container| container.state);
+        let detail_usage = if detail.kind == ResourceKind::Container {
+            let connected = matches!(&self.status, HostStatus::Connected);
+            Some(DetailUsage::from(
+                self.container_stats.get(&detail.id),
+                state.unwrap_or(ContainerState::Unknown),
+                connected,
+            ))
+        } else {
+            None
+        };
 
         let mut meta = div().flex().items_center().gap(px(8.));
         if let Some(state) = state {
@@ -520,39 +529,7 @@ impl RootView {
             );
         }
 
-        let metrics = (detail.kind == ResourceKind::Container).then(|| {
-            let running = state == Some(ContainerState::Running);
-            let stats = running
-                .then(|| self.container_stats.get(&detail.id).copied())
-                .flatten();
-            let cpu_label = format_cpu(stats.and_then(|stats| stats.cpu_percent))
-                .map(|value| format!("CPU {value}"))
-                .unwrap_or_else(|| "CPU —".to_string());
-            let memory = stats.and_then(|stats| stats.memory);
-            let mem_label = format_memory(memory)
-                .map(|value| format!("MEM {value}"))
-                .unwrap_or_else(|| "MEM —".to_string());
-            div()
-                .w(px(180.))
-                .flex_shrink_0()
-                .flex()
-                .flex_col()
-                .gap(px(10.))
-                .child(usage_meter(
-                    &cpu_label,
-                    stats.and_then(|stats| stats.cpu_percent).map(|p| p / 100.0),
-                    theme.accent,
-                    &theme,
-                ))
-                .child(usage_meter(
-                    &mem_label,
-                    memory.and_then(|m| m.percent).map(|p| p / 100.0),
-                    memory_color(memory.and_then(|m| m.percent), &theme),
-                    &theme,
-                ))
-        });
-
-        let mut hero = crate::ui::style::card(&theme)
+        let hero = crate::ui::style::card(&theme)
             .p(px(20.))
             .flex()
             .items_center()
@@ -592,11 +569,8 @@ impl RootView {
                             .child(detail.title.clone()),
                     )
                     .child(meta),
-            );
-        if let Some(metrics) = metrics {
-            hero = hero.child(metrics);
-        }
-        hero = hero.child(action_column);
+            )
+            .child(action_column);
 
         let tabs: Vec<DetailTab> = if detail.kind == ResourceKind::Container {
             vec![DetailTab::Inspect, DetailTab::Logs]
@@ -849,6 +823,9 @@ impl RootView {
                     .pt(px(if layout.compact { 16. } else { 20. }))
                     .pb(px(layout.page_padding))
                     .child(hero)
+                    .when_some(detail_usage, |this, usage| {
+                        this.child(crate::ui::usage::render_usage_band(&usage, &theme, layout))
+                    })
                     .child(tab_strip)
                     .child(
                         crate::ui::style::card(&theme)
@@ -1554,6 +1531,12 @@ impl RootView {
         let stats = self.stats.clone();
         let loading = stats.is_loading();
         let page = self.page;
+        let usage_totals = UsageTotals::from_snapshot(&self.snapshot, &self.container_stats);
+        let usage_labels = UsageCardLabels::from(
+            &usage_totals,
+            self.snapshot.fetched_at.is_some(),
+            matches!(&self.status, HostStatus::Connected),
+        );
 
         let containers = stat_card(
             StatCard {
@@ -1582,6 +1565,24 @@ impl RootView {
                     Some(stats.containers_share())
                 },
                 active: page == Page::Containers,
+            },
+            layout,
+            &theme,
+            cx,
+            |this, _window, _cx| this.switch_page(Page::Containers),
+        );
+
+        let usage = stat_card(
+            StatCard {
+                id: "overview-usage",
+                kicker: "Usage",
+                icon: "icons/activity.svg",
+                value: usage_labels.value,
+                unit: "CPU",
+                right: usage_labels.right,
+                foot: usage_labels.foot,
+                progress: None,
+                active: false,
             },
             layout,
             &theme,
@@ -1657,6 +1658,7 @@ impl RootView {
             .flex()
             .gap(px(12.))
             .child(containers)
+            .child(usage)
             .child(images)
             .child(volumes)
     }

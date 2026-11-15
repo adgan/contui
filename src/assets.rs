@@ -36,6 +36,10 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/volumes.svg"),
     ),
     (
+        "icons/activity.svg",
+        include_bytes!("../assets/icons/activity.svg"),
+    ),
+    (
         "icons/search.svg",
         include_bytes!("../assets/icons/search.svg"),
     ),
@@ -104,6 +108,11 @@ mod tests {
             assert!(text.trim_start().starts_with("<svg"), "{path} is not svg");
             assert!(text.contains("</svg>"), "{path} is not closed");
         }
+    }
+
+    #[test]
+    fn activity_icon_is_embedded() {
+        assert!(Assets.load("icons/activity.svg").unwrap().is_some());
     }
 
     #[test]

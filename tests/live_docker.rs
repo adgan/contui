@@ -29,17 +29,19 @@ fn wait_for(
         let response = responses
             .recv_blocking()
             .unwrap_or_else(|err| panic!("channel closed while waiting for {what}: {err}"));
+        if pred(&response) {
+            return response;
+        }
         match &response {
             Response::Status(_)
             | Response::HostStatuses(_)
             | Response::Dirty { .. }
             | Response::PullProgress { .. }
             | Response::Inspect { .. }
-            | Response::Logs { .. } => continue,
+            | Response::Logs { .. }
+            | Response::Stats { .. }
+            | Response::StatsStale { .. } => continue,
             _ => {}
-        }
-        if pred(&response) {
-            return response;
         }
         panic!("while waiting for {what}, got {response:?}");
     }
@@ -71,10 +73,7 @@ fn run_spec(name: &str, host_port: Option<u16>) -> RunSpec {
     }
 }
 
-fn cleanup_test_containers(
-    service: &DockerService,
-    responses: &async_channel::Receiver<Response>,
-) {
+fn cleanup_test_containers(service: &DockerService, responses: &async_channel::Receiver<Response>) {
     service.request(Request::FetchAll);
     let snapshot = match wait_for(responses, "snapshot for cleanup", |response| {
         matches!(response, Response::Snapshot(_))
@@ -153,13 +152,18 @@ fn pull_run_stop_restart_and_force_remove_round_trip() {
         force: false,
         epoch: 0,
     });
-    let blocked = action_error(&responses, "remove running container").expect("a running container refuses a plain remove");
+    let blocked = action_error(&responses, "remove running container")
+        .expect("a running container refuses a plain remove");
     assert!(
         blocked.to_lowercase().contains("running"),
         "unexpected removal error: {blocked}"
     );
 
-    service.request(Request::RemoveContainer { id, force: true, epoch: 0 });
+    service.request(Request::RemoveContainer {
+        id,
+        force: true,
+        epoch: 0,
+    });
     assert_eq!(action_error(&responses, "force remove"), None);
 }
 
@@ -223,7 +227,8 @@ fn run_with_a_taken_host_port_keeps_the_created_container() {
             ..
         } => {
             assert!(
-                message.contains("port is already allocated") || message.contains("address already in use"),
+                message.contains("port is already allocated")
+                    || message.contains("address already in use"),
                 "unexpected start error: {message}"
             );
             id
@@ -289,10 +294,7 @@ fn list_requests_are_answered_while_a_pull_runs() {
         "snapshot took {:?} while a pull was running",
         snapshot_at.duration_since(started)
     );
-    assert!(
-        pull_done,
-        "pull did not finish; last error: {pull_error:?}"
-    );
+    assert!(pull_done, "pull did not finish; last error: {pull_error:?}");
     if let Some(error) = pull_error {
         eprintln!("pull reported an error after the snapshot: {error}");
     }
@@ -344,4 +346,76 @@ fn lists_three_resources_from_live_daemon() {
     );
     assert!(!snapshot.images.is_empty(), "expected at least one image");
     assert!(snapshot.fetched_at.is_some());
+}
+
+#[test]
+#[ignore = "requires a running docker daemon"]
+fn stats_stream_reports_live_usage_for_a_running_container() {
+    let (service, responses) = connect();
+    cleanup_test_containers(&service, &responses);
+
+    service.request(Request::PullImage {
+        reference: "alpine:3.20".into(),
+        origin: PullOrigin::Header,
+        epoch: 0,
+    });
+    let pulled = wait_for(&responses, "pull alpine:3.20", |response| {
+        matches!(response, Response::PullDone { .. })
+    });
+    if let Response::PullDone {
+        error: Some(error), ..
+    } = pulled
+    {
+        eprintln!("skipping live stats test: pull failed: {error}");
+        return;
+    }
+
+    let name = format!("dockyard-live-stats-{}", std::process::id());
+    service.request(Request::RunContainer {
+        spec: run_spec(&name, None),
+        epoch: 0,
+    });
+    let created = wait_for(&responses, "run", |response| {
+        matches!(
+            response,
+            Response::ContainerCreated { .. } | Response::RunFailed { .. }
+        )
+    });
+    let id = match created {
+        Response::ContainerCreated { id, .. } => id,
+        Response::RunFailed { message, .. } => panic!("run failed: {message}"),
+        _ => unreachable!(),
+    };
+
+    service.request(Request::FetchAll);
+    let _ = wait_for(&responses, "snapshot for stats", |response| {
+        matches!(response, Response::Snapshot(_))
+    });
+    service.request(Request::WatchStats {
+        ids: vec![id.clone()],
+    });
+    let stats = wait_for(&responses, "container stats", |response| {
+        matches!(
+            response,
+            Response::Stats { stats, .. }
+                if stats.cpu_percent.is_some() && stats.memory.is_some()
+        )
+    });
+    match stats {
+        Response::Stats { stats, .. } => {
+            assert!(stats.cpu_percent.unwrap() >= 0.0);
+            assert!(
+                stats.memory.unwrap().used > 0,
+                "expected a non-zero memory working set"
+            );
+        }
+        _ => unreachable!(),
+    }
+
+    service.request(Request::RemoveContainer {
+        id,
+        force: true,
+        epoch: 0,
+    });
+    assert_eq!(action_error(&responses, "stats cleanup remove"), None);
 }

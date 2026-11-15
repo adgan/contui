@@ -8,4 +8,5 @@ pub mod stats;
 pub mod style;
 pub mod table;
 pub mod tables;
+pub mod usage;
 pub mod widgets;

@@ -10,7 +10,7 @@ use crate::theme::Theme;
 use crate::ui::detail::DetailState;
 use crate::ui::inspect::build_tree;
 use crate::ui::mutations::{Mutations, PullState, RunOutcome, RunState, Toast};
-use crate::ui::stats::OverviewStats;
+use crate::ui::stats::{OverviewStats, UsageCardLabels, UsageTotals};
 use crate::ui::table::TableState;
 use chrono::Utc;
 use gpui::prelude::*;
@@ -121,17 +121,21 @@ fn reset_host_data(
     *detail = None;
 }
 
-/// The set of containers whose stats the UI can currently show. Compose
-/// collapse and the search query deliberately do not prune this: the list
-/// page keeps every running container's stream alive, like Docker Desktop.
+/// Live stats are only meaningful while the host is connected; a red host chip
+/// must not sit beside a frozen number.
+fn keeps_stats(status: &HostStatus) -> bool {
+    matches!(status, HostStatus::Connected)
+}
+
+/// The set of containers whose stats the UI can currently show. The overview
+/// usage card is global, so every list page needs the running containers; the
+/// detail page only needs the container it shows. Compose collapse and the
+/// search query deliberately do not prune: the list keeps every running
+/// container's stream alive, like Docker Desktop.
 fn stats_targets_for(
-    page: Page,
     detail: Option<&DetailState>,
     containers: &[ContainerRow],
 ) -> HashSet<String> {
-    if page != Page::Containers {
-        return HashSet::new();
-    }
     if let Some(detail) = detail {
         if detail.kind != ResourceKind::Container {
             return HashSet::new();
@@ -252,6 +256,9 @@ impl RootView {
                         };
                         let updated = entity.update(cx, |view, cx| {
                             view.apply(response);
+                            while let Ok(next) = responses.try_recv() {
+                                view.apply(next);
+                            }
                             cx.notify();
                         });
                         if updated.is_err() {
@@ -320,6 +327,9 @@ impl RootView {
                 self.sync_stats_targets();
             }
             Response::Status(status) => {
+                if !keeps_stats(&status) {
+                    self.container_stats.clear();
+                }
                 let had_work = self.mutations.has_in_flight();
                 if should_refetch_on_status(&self.status, &status) {
                     self.status = status;
@@ -468,14 +478,12 @@ impl RootView {
             Response::Stats { id, stats } => {
                 if self.watched_stats.contains(&id) {
                     self.container_stats.insert(id, stats);
-                    if self.page == Page::Containers {
-                        let rows = crate::ui::tables::containers_table(
-                            &self.snapshot,
-                            &self.container_stats,
-                        )
-                        .rows;
-                        self.tables[Page::Containers.index()].replace_rows(rows);
-                    }
+                    self.refresh_container_rows();
+                }
+            }
+            Response::StatsStale { id } => {
+                if self.container_stats.remove(&id).is_some() {
+                    self.refresh_container_rows();
                 }
             }
         }
@@ -486,17 +494,25 @@ impl RootView {
             crate::ui::tables::tables_from(&self.snapshot, &self.container_stats, &self.tables);
     }
 
-    /// Aligns the service's stats streams with what the page and detail show,
-    /// and drops readings that are no longer watched.
-    fn sync_stats_targets(&mut self) {
-        let targets = stats_targets_for(self.page, self.detail.as_ref(), &self.snapshot.containers);
-        self.watched_stats = targets.clone();
-        self.container_stats.retain(|id, _| targets.contains(id));
-        if self.page == Page::Containers {
-            let rows =
-                crate::ui::tables::containers_table(&self.snapshot, &self.container_stats).rows;
-            self.tables[Page::Containers.index()].replace_rows(rows);
+    /// Repaints the containers rows from the current readings without a full
+    /// table rebuild, so scroll and selection survive a sample.
+    fn refresh_container_rows(&mut self) {
+        if self.page != Page::Containers {
+            return;
         }
+        let rows =
+            crate::ui::tables::containers_table(&self.snapshot, &self.container_stats).rows;
+        self.tables[Page::Containers.index()].replace_rows(rows);
+    }
+
+    /// Aligns the service's stats streams with what the page and detail show.
+    /// Readings for running containers are kept across the switch so returning
+    /// from a detail page does not blank the overview card; the snapshot path
+    /// drops readings for containers that stopped.
+    fn sync_stats_targets(&mut self) {
+        let targets = stats_targets_for(self.detail.as_ref(), &self.snapshot.containers);
+        self.watched_stats = targets.clone();
+        self.refresh_container_rows();
         if let Some(service) = &self.service {
             service.request(Request::WatchStats {
                 ids: targets.into_iter().collect(),
@@ -1257,7 +1273,6 @@ mod tests {
             "alpha-id".into(),
             "alpha".into(),
         ));
-
         reset_host_data(&mut snapshot, &mut tables, &mut detail);
 
         assert!(snapshot.containers.is_empty());
@@ -1267,28 +1282,37 @@ mod tests {
     }
 
     #[test]
-    fn stats_targets_follow_page_and_detail() {
+    fn stats_are_only_kept_while_the_host_is_connected() {
+        assert!(keeps_stats(&HostStatus::Connected));
+        assert!(!keeps_stats(&HostStatus::Unknown));
+        assert!(!keeps_stats(&HostStatus::Unreachable("gone".into())));
+        assert!(!keeps_stats(&HostStatus::AuthFailed("denied".into())));
+    }
+
+    #[test]
+    fn stats_targets_follow_detail_and_the_global_usage_card() {
         let containers = vec![
             container("web", ContainerState::Running),
             container("db", ContainerState::Running),
             container("job", ContainerState::Exited),
         ];
-        assert!(stats_targets_for(Page::Images, None, &containers).is_empty());
+        // The overview usage card is global, so every list page watches every
+        // running container.
         assert_eq!(
-            stats_targets_for(Page::Containers, None, &containers),
+            stats_targets_for(None, &containers),
             HashSet::from(["web-id".to_string(), "db-id".to_string()])
         );
 
         let web = DetailState::new(ResourceKind::Container, "web-id".into(), "web".into());
         assert_eq!(
-            stats_targets_for(Page::Containers, Some(&web), &containers),
+            stats_targets_for(Some(&web), &containers),
             HashSet::from(["web-id".to_string()])
         );
 
         let stopped = DetailState::new(ResourceKind::Container, "job-id".into(), "job".into());
-        assert!(stats_targets_for(Page::Containers, Some(&stopped), &containers).is_empty());
+        assert!(stats_targets_for(Some(&stopped), &containers).is_empty());
 
         let image = DetailState::new(ResourceKind::Image, "web-id".into(), "web".into());
-        assert!(stats_targets_for(Page::Containers, Some(&image), &containers).is_empty());
+        assert!(stats_targets_for(Some(&image), &containers).is_empty());
     }
 }
