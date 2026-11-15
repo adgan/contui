@@ -1,6 +1,8 @@
 use super::*;
 use crate::docker::actions::{ActionKind, container_actions};
-use crate::docker::model::{ContainerState, ResourceKind, format_bytes};
+use crate::docker::model::{
+    ContainerState, ResourceKind, format_bytes, format_cpu, format_memory,
+};
 use crate::theme::Theme;
 use crate::ui::detail::{DetailTab, render_logs};
 use crate::ui::inspect::InspectNode;
@@ -10,6 +12,7 @@ use crate::ui::table::{CellStyle, ColumnWidth};
 use crate::ui::widgets::button::{ButtonSpec, button};
 use crate::ui::widgets::pill::{state_pill, state_pill_inline};
 use crate::ui::widgets::stat_card::{StatCard, stat_card};
+use crate::ui::widgets::usage_meter::{memory_color, usage_meter};
 use gpui::{
     AnyElement, Context, Div, FontWeight, IntoElement, MouseButton, Render, SharedString, Window,
     div, px, svg, uniform_list,
@@ -504,7 +507,39 @@ impl RootView {
             );
         }
 
-        let hero = crate::ui::style::card(&theme)
+        let metrics = (detail.kind == ResourceKind::Container).then(|| {
+            let running = state == Some(ContainerState::Running);
+            let stats = running
+                .then(|| self.container_stats.get(&detail.id).copied())
+                .flatten();
+            let cpu_label = format_cpu(stats.and_then(|stats| stats.cpu_percent))
+                .map(|value| format!("CPU {value}"))
+                .unwrap_or_else(|| "CPU —".to_string());
+            let memory = stats.and_then(|stats| stats.memory);
+            let mem_label = format_memory(memory)
+                .map(|value| format!("MEM {value}"))
+                .unwrap_or_else(|| "MEM —".to_string());
+            div()
+                .w(px(180.))
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(usage_meter(
+                    &cpu_label,
+                    stats.and_then(|stats| stats.cpu_percent).map(|p| p / 100.0),
+                    theme.accent,
+                    &theme,
+                ))
+                .child(usage_meter(
+                    &mem_label,
+                    memory.and_then(|m| m.percent).map(|p| p / 100.0),
+                    memory_color(memory.and_then(|m| m.percent), &theme),
+                    &theme,
+                ))
+        });
+
+        let mut hero = crate::ui::style::card(&theme)
             .p(px(20.))
             .flex()
             .items_center()
@@ -544,8 +579,11 @@ impl RootView {
                             .child(detail.title.clone()),
                     )
                     .child(meta),
-            )
-            .child(action_column);
+            );
+        if let Some(metrics) = metrics {
+            hero = hero.child(metrics);
+        }
+        hero = hero.child(action_column);
 
         let tabs: Vec<DetailTab> = if detail.kind == ResourceKind::Container {
             vec![DetailTab::Inspect, DetailTab::Logs]
@@ -1960,6 +1998,34 @@ impl RootView {
                             continue;
                         }
 
+                        if matches!(style, CellStyle::Cpu | CellStyle::Memory) {
+                            let stats = this.container_stats.get(&row_id).copied();
+                            let (fraction, color) = match style {
+                                CellStyle::Cpu => (
+                                    stats.and_then(|stats| stats.cpu_percent).map(|p| p / 100.0),
+                                    theme.accent,
+                                ),
+                                _ => {
+                                    let percent =
+                                        stats.and_then(|stats| stats.memory).and_then(|m| m.percent);
+                                    (
+                                        percent.map(|p| p / 100.0),
+                                        memory_color(percent, &theme),
+                                    )
+                                }
+                            };
+                            element = element.child(
+                                div()
+                                    .map_width(width)
+                                    .h_full()
+                                    .flex()
+                                    .flex_col()
+                                    .justify_center()
+                                    .child(usage_meter(cell.as_ref(), fraction, color, &theme)),
+                            );
+                            continue;
+                        }
+
                         let mut text = div().map_width(width).truncate().child(cell.clone());
                         match style {
                             CellStyle::Text => {
@@ -1973,13 +2039,14 @@ impl RootView {
                                     })
                                     .text_color(theme.text);
                             }
-                            CellStyle::Mono | CellStyle::Cpu | CellStyle::Memory => {
+                            CellStyle::Mono => {
                                 text = text
                                     .font_family("JetBrains Mono")
                                     .text_size(px(12.))
                                     .line_height(px(16.))
                                     .text_color(theme.text_dim);
                             }
+                            CellStyle::Cpu | CellStyle::Memory => {}
                             CellStyle::Timestamp => {
                                 text = text
                                     .text_size(px(11.))
