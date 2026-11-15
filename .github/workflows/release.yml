@@ -1,0 +1,78 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the v (e.g. 0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency: release
+
+jobs:
+  # Everything that does not need macOS: the release, the source tarball, the formula.
+  prepare:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/v${{ inputs.version }}
+      - name: Check tag matches Cargo.toml
+        run: grep -qx "version = \"$VERSION\"" Cargo.toml
+      - name: Create the release
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then exit 0; fi
+          notes=".github/release-notes/$VERSION.md"
+          if [ -f "$notes" ]; then
+            gh release create "v$VERSION" --title "contUI $VERSION" --notes-file "$notes"
+          else
+            gh release create "v$VERSION" --title "contUI $VERSION" --generate-notes
+          fi
+      - name: Build source tarball and stable formula
+        run: scripts/prepare-release.sh "$VERSION" dist
+      - name: Publish source tarball
+        run: gh release upload "v$VERSION" dist/contui-*.tar.gz --clobber
+      - uses: actions/upload-artifact@v4
+        with:
+          name: formula-base
+          path: dist/contui.rb
+
+  # The only macOS work: build the bottle from the formula the prepare job wrote.
+  bottle:
+    needs: prepare
+    runs-on: macos-26
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_ANALYTICS: 1
+      HOMEBREW_NO_ENV_HINTS: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/v${{ inputs.version }}
+          sparse-checkout: scripts
+      - uses: actions/download-artifact@v4
+        with:
+          name: formula-base
+          path: dist
+      - name: Build bottle
+        run: scripts/build-bottle.sh "$VERSION" dist
+      - name: Publish bottle
+        run: gh release upload "v$VERSION" dist/*.bottle.tar.gz --clobber
+      - name: Publish formula for the tap
+        run: cat dist/contui.rb >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: formula
+          path: dist/contui.rb

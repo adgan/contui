@@ -8,3 +8,12 @@ bundle:
     cp -R assets/fonts target/contUI.app/Contents/Resources/fonts
     codesign --force --deep --sign - target/contUI.app
     @echo "built target/contUI.app"
+
+# Build the release tarball and stable formula into dist/ (no macOS needed). Needs the tag.
+release-prepare version:
+    scripts/prepare-release.sh {{version}} dist
+
+# Bottle dist/contui.rb into dist/. macOS only.
+release-bottle version:
+    scripts/build-bottle.sh {{version}} dist
+
