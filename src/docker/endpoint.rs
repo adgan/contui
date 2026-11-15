@@ -242,24 +242,24 @@ fn config_current_context(home: &Path) -> Option<String> {
 pub fn discover(env: &HashMap<String, String>, home: &Path) -> Discovery {
     let mut hosts = read_contexts(home);
 
-    if let Some(raw) = env.get("DOCKER_HOST").map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        if let Some(endpoint) = parse_host(raw) {
-            let id = format!("env:{}", strip_scheme(raw));
-            let detail = raw.to_string();
-            let name = socket_app_name(Path::new(strip_scheme(raw)));
-            let (endpoint, tls) = apply_env_tls(endpoint, env);
-            hosts.insert(
-                0,
-                HostInfo {
-                    id,
-                    name,
-                    detail,
-                    status: status_for(&endpoint),
-                    endpoint,
-                    tls,
-                },
-            );
-        }
+    if let Some(raw) = env.get("DOCKER_HOST").map(|s| s.trim()).filter(|s| !s.is_empty())
+        && let Some(endpoint) = parse_host(raw)
+    {
+        let id = format!("env:{}", strip_scheme(raw));
+        let detail = raw.to_string();
+        let name = socket_app_name(Path::new(strip_scheme(raw)));
+        let (endpoint, tls) = apply_env_tls(endpoint, env);
+        hosts.insert(
+            0,
+            HostInfo {
+                id,
+                name,
+                detail,
+                status: status_for(&endpoint),
+                endpoint,
+                tls,
+            },
+        );
     }
 
     for socket in candidate_sockets(home) {

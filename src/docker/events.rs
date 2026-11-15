@@ -22,7 +22,7 @@ pub fn classify(event: &EventMessage) -> Option<(ResourceKind, Option<String>)> 
 /// `DEBOUNCE`, so a burst of events causes one refetch.
 #[derive(Debug, Default)]
 pub struct Debouncer {
-    pending: BTreeSet<ResourceKind>,
+    pending: bool,
     ids: BTreeSet<(ResourceKind, String)>,
     last_event: Option<Instant>,
 }
@@ -34,7 +34,7 @@ impl Debouncer {
 
     pub fn record(&mut self, event: &EventMessage, now: Instant) {
         if let Some((kind, id)) = classify(event) {
-            self.pending.insert(kind);
+            self.pending = true;
             if let Some(id) = id {
                 self.ids.insert((kind, id));
             }
@@ -42,23 +42,19 @@ impl Debouncer {
         }
     }
 
-    pub fn take_if_due(
-        &mut self,
-        now: Instant,
-    ) -> Option<(Vec<ResourceKind>, Vec<(ResourceKind, String)>)> {
-        if self.pending.is_empty() {
+    /// Returns the ids touched since the last flush; an empty list still means
+    /// "something changed", so the caller refetches even for anonymous events.
+    pub fn take_if_due(&mut self, now: Instant) -> Option<Vec<(ResourceKind, String)>> {
+        if !self.pending {
             return None;
         }
         let last = self.last_event?;
         if now.duration_since(last) < DEBOUNCE {
             return None;
         }
-        let kinds: Vec<ResourceKind> = self.pending.iter().copied().collect();
-        let ids: Vec<(ResourceKind, String)> = self.ids.iter().cloned().collect();
-        self.pending.clear();
-        self.ids.clear();
+        self.pending = false;
         self.last_event = None;
-        Some((kinds, ids))
+        Some(std::mem::take(&mut self.ids).into_iter().collect())
     }
 }
 
@@ -136,10 +132,9 @@ mod tests {
         d.record(&container_event("start", "b"), t0 + Duration::from_millis(100));
         assert!(d.take_if_due(t0 + Duration::from_millis(200)).is_none());
         assert!(d.take_if_due(t0 + Duration::from_millis(300)).is_none());
-        let (kinds, ids) = d
+        let ids = d
             .take_if_due(t0 + Duration::from_millis(351))
             .expect("flush");
-        assert_eq!(kinds, vec![ResourceKind::Container]);
         assert_eq!(ids.len(), 2);
         assert!(d.take_if_due(t0 + Duration::from_millis(400)).is_none());
     }

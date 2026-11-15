@@ -142,16 +142,11 @@ pub fn split_image_reference(reference: &str) -> (String, Option<String>) {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Proto {
+    #[default]
     Tcp,
     Udp,
-}
-
-impl Default for Proto {
-    fn default() -> Self {
-        Proto::Tcp
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -311,7 +306,23 @@ pub fn split_command(input: &str) -> Result<Vec<String>, String> {
 
 pub fn build_run_spec(form: &RunForm) -> Result<RunSpec, Vec<FieldError>> {
     let mut errors = Vec::new();
+    let spec = RunSpec {
+        image: validate_image(form, &mut errors),
+        name: validate_name(form, &mut errors),
+        command: validate_command(form, &mut errors),
+        ports: validate_ports(form, &mut errors),
+        env: validate_env(form, &mut errors),
+        mounts: validate_mounts(form, &mut errors),
+    };
 
+    if errors.is_empty() {
+        Ok(spec)
+    } else {
+        Err(errors)
+    }
+}
+
+fn validate_image(form: &RunForm, errors: &mut Vec<FieldError>) -> String {
     let image = form.image.trim();
     if image.is_empty() {
         errors.push(FieldError {
@@ -319,7 +330,10 @@ pub fn build_run_spec(form: &RunForm) -> Result<RunSpec, Vec<FieldError>> {
             message: "Image is required".to_string(),
         });
     }
+    image.to_string()
+}
 
+fn validate_name(form: &RunForm, errors: &mut Vec<FieldError>) -> Option<String> {
     let name = form.name.trim();
     if !name.is_empty() && !valid_name(name) {
         errors.push(FieldError {
@@ -328,22 +342,26 @@ pub fn build_run_spec(form: &RunForm) -> Result<RunSpec, Vec<FieldError>> {
                 .to_string(),
         });
     }
+    (!name.is_empty()).then(|| name.to_string())
+}
 
-    let command = if form.command.trim().is_empty() {
-        None
-    } else {
-        match split_command(&form.command) {
-            Ok(args) => Some(args),
-            Err(message) => {
-                errors.push(FieldError {
-                    field: RunField::Command,
-                    message,
-                });
-                None
-            }
+fn validate_command(form: &RunForm, errors: &mut Vec<FieldError>) -> Option<Vec<String>> {
+    if form.command.trim().is_empty() {
+        return None;
+    }
+    match split_command(&form.command) {
+        Ok(args) => Some(args),
+        Err(message) => {
+            errors.push(FieldError {
+                field: RunField::Command,
+                message,
+            });
+            None
         }
-    };
+    }
+}
 
+fn validate_ports(form: &RunForm, errors: &mut Vec<FieldError>) -> Vec<PortSpec> {
     let mut ports = Vec::new();
     let mut host_ports = HashSet::new();
     let mut container_ports = HashSet::new();
@@ -377,14 +395,14 @@ pub fn build_run_spec(form: &RunForm) -> Result<RunSpec, Vec<FieldError>> {
         };
         let udp = port.proto == Proto::Udp;
 
-        if let Some(value) = host {
-            if !host_ports.insert((value, udp)) {
-                errors.push(FieldError {
-                    field: RunField::PortHost(index),
-                    message: "Host port is used twice".to_string(),
-                });
-                valid = false;
-            }
+        if let Some(value) = host
+            && !host_ports.insert((value, udp))
+        {
+            errors.push(FieldError {
+                field: RunField::PortHost(index),
+                message: "Host port is used twice".to_string(),
+            });
+            valid = false;
         }
         if container != 0 && !container_ports.insert((container, udp)) {
             errors.push(FieldError {
@@ -401,7 +419,10 @@ pub fn build_run_spec(form: &RunForm) -> Result<RunSpec, Vec<FieldError>> {
             });
         }
     }
+    ports
+}
 
+fn validate_env(form: &RunForm, errors: &mut Vec<FieldError>) -> Vec<(String, String)> {
     let mut env = Vec::new();
     let mut env_keys = HashSet::new();
     for (index, variable) in form.env.iter().enumerate() {
@@ -433,7 +454,10 @@ pub fn build_run_spec(form: &RunForm) -> Result<RunSpec, Vec<FieldError>> {
             env.push((key.to_string(), variable.value.clone()));
         }
     }
+    env
+}
 
+fn validate_mounts(form: &RunForm, errors: &mut Vec<FieldError>) -> Vec<MountSpec> {
     let mut mounts = Vec::new();
     for (index, mount) in form.mounts.iter().enumerate() {
         let source = mount.source.trim();
@@ -475,19 +499,7 @@ pub fn build_run_spec(form: &RunForm) -> Result<RunSpec, Vec<FieldError>> {
             });
         }
     }
-
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-
-    Ok(RunSpec {
-        image: image.to_string(),
-        name: (!name.is_empty()).then(|| name.to_string()),
-        command,
-        ports,
-        env,
-        mounts,
-    })
+    mounts
 }
 
 pub fn run_body(spec: &RunSpec) -> ContainerCreateBody {
@@ -527,23 +539,24 @@ pub fn run_body(spec: &RunSpec) -> ContainerCreateBody {
         );
     }
 
-    let mut body = ContainerCreateBody::default();
-    body.image = Some(spec.image.clone());
-    body.cmd = spec.command.clone();
-    body.env = (!spec.env.is_empty()).then(|| {
-        spec.env
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect()
-    });
-    body.exposed_ports = (!spec.ports.is_empty()).then(|| {
-        spec.ports
-            .iter()
-            .map(|port| port_key(port.container, port.udp))
-            .collect()
-    });
-    body.host_config = Some(host);
-    body
+    ContainerCreateBody {
+        image: Some(spec.image.clone()),
+        cmd: spec.command.clone(),
+        env: (!spec.env.is_empty()).then(|| {
+            spec.env
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect()
+        }),
+        exposed_ports: (!spec.ports.is_empty()).then(|| {
+            spec.ports
+                .iter()
+                .map(|port| port_key(port.container, port.udp))
+                .collect()
+        }),
+        host_config: Some(host),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
@@ -688,7 +701,7 @@ mod tests {
             spec.env,
             vec![("POSTGRES_PASSWORD".into(), "secret".into())]
         );
-        assert_eq!(spec.mounts[0].read_only, true);
+        assert!(spec.mounts[0].read_only);
     }
 
     #[test]

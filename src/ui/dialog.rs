@@ -182,10 +182,12 @@ pub fn pull_popover(
         reference,
         "image[:tag]",
         focus,
-        focused,
-        error.is_some(),
-        pulling,
-        true,
+        text_input::FieldStyle {
+            focused,
+            error: error.is_some(),
+            read_only: pulling,
+            mono: true,
+        },
         theme,
     )
     .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
@@ -341,27 +343,45 @@ fn field_error(run: &RunState, field: RunField) -> Option<String> {
         .map(|error| error.message.clone())
 }
 
-fn input_field(
+/// What one single-line field in the run form shows and edits. Grouping these
+/// keeps call sites readable instead of passing a run of bare booleans.
+struct FieldInput<'a> {
     field: RunField,
-    text: &str,
-    placeholder: &str,
-    focus: &FocusHandle,
+    text: &'a str,
+    placeholder: &'a str,
+    focus: &'a FocusHandle,
     error: Option<String>,
     read_only: bool,
     mono: bool,
+}
+
+fn input_field(
+    input: FieldInput<'_>,
     theme: &Theme,
     window: &Window,
     cx: &mut Context<RootView>,
 ) -> gpui::Stateful<gpui::Div> {
+    let FieldInput {
+        field,
+        text,
+        placeholder,
+        focus,
+        error,
+        read_only,
+        mono,
+    } = input;
+
     text_input::field(
         field_id(field),
         text,
         placeholder,
         focus,
-        focus.is_focused(window),
-        error.is_some(),
-        read_only,
-        mono,
+        text_input::FieldStyle {
+            focused: focus.is_focused(window),
+            error: error.is_some(),
+            read_only,
+            mono,
+        },
         theme,
     )
     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
@@ -378,45 +398,29 @@ fn input_field(
             this.submit_run(window, cx);
             return;
         }
-        if let Some(target) = this.run_field_text_mut(field) {
-            if text_input::edit_text(target, event, cx) {
-                this.clear_run_field_error(field);
-                cx.notify();
-            }
+        if let Some(target) = this.run_field_text_mut(field)
+            && text_input::edit_text(target, event, cx)
+        {
+            this.clear_run_field_error(field);
+            cx.notify();
         }
     }))
 }
 
 fn labeled(
     label: &'static str,
-    field: RunField,
-    text: &str,
-    placeholder: &str,
-    focus: &FocusHandle,
-    error: Option<String>,
-    read_only: bool,
-    mono: bool,
+    input: FieldInput<'_>,
     theme: &Theme,
     window: &Window,
     cx: &mut Context<RootView>,
 ) -> gpui::Div {
+    let error = input.error.clone();
     let mut column = div()
         .flex()
         .flex_col()
         .gap_1()
         .child(div().text_xs().text_color(theme.text_dim).child(label))
-        .child(input_field(
-            field,
-            text,
-            placeholder,
-            focus,
-            error.clone(),
-            read_only,
-            mono,
-            theme,
-            window,
-            cx,
-        ));
+        .child(input_field(input, theme, window, cx));
     if let Some(message) = error {
         column = column.child(div().text_xs().text_color(theme.error).child(message));
     }
@@ -515,90 +519,23 @@ fn remove_button(
     button
 }
 
-pub fn run_dialog(
+fn ports_section(
     run: &RunState,
     focus: &RunFocus,
-    pulling: bool,
+    frozen: bool,
     theme: &Theme,
-    window: &mut Window,
+    window: &Window,
     cx: &mut Context<RootView>,
-) -> AnyElement {
-    let submitting = run.submitting;
-    let frozen = run.is_frozen(pulling);
-    let read_only = frozen;
-
-    let backdrop = div()
-        .absolute()
-        .inset_0()
-        .occlude()
-        .bg(gpui::rgba(0x000000aa))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _event, _window, cx| {
-                this.cancel_run();
-                cx.notify();
-            }),
-        );
-
-    let mut body = div()
-        .id("run-body")
-        .flex_1()
-        .min_h(px(0.))
-        .overflow_y_scroll()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_4();
-
-    body = body
-        .child(labeled(
-            "Image *",
-            RunField::Image,
-            &run.form.image,
-            "postgres:18",
-            &focus.image,
-            field_error(run, RunField::Image),
-            read_only,
-            true,
-            theme,
-            window,
-            cx,
-        ))
-        .child(labeled(
-            "Name",
-            RunField::Name,
-            &run.form.name,
-            "optional",
-            &focus.name,
-            field_error(run, RunField::Name),
-            read_only,
-            false,
-            theme,
-            window,
-            cx,
-        ))
-        .child(labeled(
-            "Command",
-            RunField::Command,
-            &run.form.command,
-            "run the image default",
-            &focus.command,
-            field_error(run, RunField::Command),
-            read_only,
-            true,
-            theme,
-            window,
-            cx,
-        ));
-
-    body = body.child(section_header(
+) -> Vec<gpui::Div> {
+    let mut children = vec![section_header(
         "Ports",
         "+ Add port",
         frozen,
         theme,
         cx,
         |this, cx| this.add_run_port(cx),
-    ));
+    )];
+
     for index in 0..run.form.ports.len() {
         let Some((host_focus, container_focus)) = focus.ports.get(index).cloned() else {
             continue;
@@ -609,25 +546,29 @@ pub fn run_dialog(
             .items_start()
             .gap_2()
             .child(div().w(px(92.)).child(input_field(
-                RunField::PortHost(index),
-                &port.host,
-                "host",
-                &host_focus,
-                field_error(run, RunField::PortHost(index)),
-                read_only,
-                false,
+                FieldInput {
+                    field: RunField::PortHost(index),
+                    text: &port.host,
+                    placeholder: "host",
+                    focus: &host_focus,
+                    error: field_error(run, RunField::PortHost(index)),
+                    read_only: frozen,
+                    mono: false,
+                },
                 theme,
                 window,
                 cx,
             )))
             .child(div().w(px(96.)).child(input_field(
-                RunField::PortContainer(index),
-                &port.container,
-                "container",
-                &container_focus,
-                field_error(run, RunField::PortContainer(index)),
-                read_only,
-                false,
+                FieldInput {
+                    field: RunField::PortContainer(index),
+                    text: &port.container,
+                    placeholder: "container",
+                    focus: &container_focus,
+                    error: field_error(run, RunField::PortContainer(index)),
+                    read_only: frozen,
+                    mono: false,
+                },
                 theme,
                 window,
                 cx,
@@ -663,17 +604,29 @@ pub fn run_dialog(
         {
             row = row.child(div().text_xs().text_color(theme.error).child(message));
         }
-        body = body.child(row);
+        children.push(row);
     }
 
-    body = body.child(section_header(
+    children
+}
+
+fn env_section(
+    run: &RunState,
+    focus: &RunFocus,
+    frozen: bool,
+    theme: &Theme,
+    window: &Window,
+    cx: &mut Context<RootView>,
+) -> Vec<gpui::Div> {
+    let mut children = vec![section_header(
         "Environment",
         "+ Add variable",
         frozen,
         theme,
         cx,
         |this, cx| this.add_run_env(cx),
-    ));
+    )];
+
     for index in 0..run.form.env.len() {
         let Some((key_focus, value_focus)) = focus.env.get(index).cloned() else {
             continue;
@@ -684,25 +637,29 @@ pub fn run_dialog(
             .items_start()
             .gap_2()
             .child(div().flex_1().min_w(px(0.)).child(input_field(
-                RunField::EnvKey(index),
-                &variable.key,
-                "KEY",
-                &key_focus,
-                field_error(run, RunField::EnvKey(index)),
-                read_only,
-                true,
+                FieldInput {
+                    field: RunField::EnvKey(index),
+                    text: &variable.key,
+                    placeholder: "KEY",
+                    focus: &key_focus,
+                    error: field_error(run, RunField::EnvKey(index)),
+                    read_only: frozen,
+                    mono: true,
+                },
                 theme,
                 window,
                 cx,
             )))
             .child(div().flex_1().min_w(px(0.)).child(input_field(
-                RunField::EnvValue(index),
-                &variable.value,
-                "value",
-                &value_focus,
-                field_error(run, RunField::EnvValue(index)),
-                read_only,
-                true,
+                FieldInput {
+                    field: RunField::EnvValue(index),
+                    text: &variable.value,
+                    placeholder: "value",
+                    focus: &value_focus,
+                    error: field_error(run, RunField::EnvValue(index)),
+                    read_only: frozen,
+                    mono: true,
+                },
                 theme,
                 window,
                 cx,
@@ -717,17 +674,29 @@ pub fn run_dialog(
         if let Some(message) = field_error(run, RunField::EnvKey(index)) {
             row = row.child(div().text_xs().text_color(theme.error).child(message));
         }
-        body = body.child(row);
+        children.push(row);
     }
 
-    body = body.child(section_header(
+    children
+}
+
+fn mounts_section(
+    run: &RunState,
+    focus: &RunFocus,
+    frozen: bool,
+    theme: &Theme,
+    window: &Window,
+    cx: &mut Context<RootView>,
+) -> Vec<gpui::Div> {
+    let mut children = vec![section_header(
         "Volumes",
         "+ Add volume",
         frozen,
         theme,
         cx,
         |this, cx| this.add_run_mount(cx),
-    ));
+    )];
+
     for index in 0..run.form.mounts.len() {
         let Some((source_focus, target_focus)) = focus.mounts.get(index).cloned() else {
             continue;
@@ -738,25 +707,29 @@ pub fn run_dialog(
             .items_start()
             .gap_2()
             .child(div().w(px(180.)).child(input_field(
-                RunField::MountSource(index),
-                &mount.source,
-                "volume or host path",
-                &source_focus,
-                field_error(run, RunField::MountSource(index)),
-                read_only,
-                true,
+                FieldInput {
+                    field: RunField::MountSource(index),
+                    text: &mount.source,
+                    placeholder: "volume or host path",
+                    focus: &source_focus,
+                    error: field_error(run, RunField::MountSource(index)),
+                    read_only: frozen,
+                    mono: true,
+                },
                 theme,
                 window,
                 cx,
             )))
             .child(div().flex_1().min_w(px(0.)).child(input_field(
-                RunField::MountTarget(index),
-                &mount.target,
-                "/path/in/container",
-                &target_focus,
-                field_error(run, RunField::MountTarget(index)),
-                read_only,
-                true,
+                FieldInput {
+                    field: RunField::MountTarget(index),
+                    text: &mount.target,
+                    placeholder: "/path/in/container",
+                    focus: &target_focus,
+                    error: field_error(run, RunField::MountTarget(index)),
+                    read_only: frozen,
+                    mono: true,
+                },
                 theme,
                 window,
                 cx,
@@ -782,7 +755,101 @@ pub fn run_dialog(
         {
             row = row.child(div().text_xs().text_color(theme.error).child(message));
         }
-        body = body.child(row);
+        children.push(row);
+    }
+
+    children
+}
+
+pub fn run_dialog(
+    run: &RunState,
+    focus: &RunFocus,
+    pulling: bool,
+    theme: &Theme,
+    window: &mut Window,
+    cx: &mut Context<RootView>,
+) -> AnyElement {
+    let submitting = run.submitting;
+    let frozen = run.is_frozen(pulling);
+
+    let backdrop = div()
+        .absolute()
+        .inset_0()
+        .occlude()
+        .bg(gpui::rgba(0x000000aa))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _event, _window, cx| {
+                this.cancel_run();
+                cx.notify();
+            }),
+        );
+
+    let mut body = div()
+        .id("run-body")
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_4();
+
+    body = body
+        .child(labeled(
+            "Image *",
+            FieldInput {
+                field: RunField::Image,
+                text: &run.form.image,
+                placeholder: "postgres:18",
+                focus: &focus.image,
+                error: field_error(run, RunField::Image),
+                read_only: frozen,
+                mono: true,
+            },
+            theme,
+            window,
+            cx,
+        ))
+        .child(labeled(
+            "Name",
+            FieldInput {
+                field: RunField::Name,
+                text: &run.form.name,
+                placeholder: "optional",
+                focus: &focus.name,
+                error: field_error(run, RunField::Name),
+                read_only: frozen,
+                mono: false,
+            },
+            theme,
+            window,
+            cx,
+        ))
+        .child(labeled(
+            "Command",
+            FieldInput {
+                field: RunField::Command,
+                text: &run.form.command,
+                placeholder: "run the image default",
+                focus: &focus.command,
+                error: field_error(run, RunField::Command),
+                read_only: frozen,
+                mono: true,
+            },
+            theme,
+            window,
+            cx,
+        ));
+
+    for child in ports_section(run, focus, frozen, theme, window, cx) {
+        body = body.child(child);
+    }
+    for child in env_section(run, focus, frozen, theme, window, cx) {
+        body = body.child(child);
+    }
+    for child in mounts_section(run, focus, frozen, theme, window, cx) {
+        body = body.child(child);
     }
 
     let mut footer = div()
