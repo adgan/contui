@@ -129,10 +129,7 @@ fn keeps_usage(status: &HostStatus) -> bool {
 
 /// Drops samples for containers that stopped or disappeared, so the map only
 /// ever carries running containers.
-fn retain_running_usage(
-    usage: &mut HashMap<String, ContainerUsage>,
-    snapshot: &Snapshot,
-) {
+fn retain_running_usage(usage: &mut HashMap<String, ContainerUsage>, snapshot: &Snapshot) {
     let running: HashSet<&str> = snapshot
         .containers
         .iter()

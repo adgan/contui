@@ -810,9 +810,7 @@ impl RootView {
                     .pb(px(layout.page_padding))
                     .child(hero)
                     .when_some(detail_usage, |this, usage| {
-                        this.child(crate::ui::usage::render_usage_band(
-                            &usage, &theme, layout,
-                        ))
+                        this.child(crate::ui::usage::render_usage_band(&usage, &theme, layout))
                     })
                     .child(tab_strip)
                     .child(

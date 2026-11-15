@@ -1,14 +1,12 @@
 use crate::docker::actions::{
-    classify_run_error, clean_error, run_body, split_image_reference, ActionKind, ContainerAction,
-    RunSpec, Target,
+    ActionKind, ContainerAction, RunSpec, Target, classify_run_error, clean_error, run_body,
+    split_image_reference,
 };
-use crate::docker::endpoint::{
-    discover, EndpointKind, HostInfo, HostStatus, TlsFiles,
-};
+use crate::docker::endpoint::{EndpointKind, HostInfo, HostStatus, TlsFiles, discover};
 use crate::docker::events::Debouncer;
 use crate::docker::model::{
-    parse_logs, status_from_error, ContainerRow, ContainerState, ContainerUsage, ImageRow,
-    LogLine, ResourceKind, Snapshot, VolumeRow,
+    ContainerRow, ContainerState, ContainerUsage, ImageRow, LogLine, ResourceKind, Snapshot,
+    VolumeRow, parse_logs, status_from_error,
 };
 use async_channel::{Receiver, Sender};
 use bollard::Docker;
@@ -21,7 +19,7 @@ use bollard::query_parameters::{
     StopContainerOptions, StopContainerOptionsBuilder,
 };
 use chrono::Utc;
-use futures_util::{join, StreamExt};
+use futures_util::{StreamExt, join};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -205,8 +203,12 @@ impl Drop for DockerService {
 fn build_docker(host: &HostInfo) -> Result<Docker, String> {
     let version = bollard::API_DEFAULT_VERSION;
     match host.endpoint.kind {
-        EndpointKind::Unix => Docker::connect_with_unix(&host.endpoint.address, CLIENT_TIMEOUT_SECS, version),
-        EndpointKind::Http => Docker::connect_with_http(&host.endpoint.address, CLIENT_TIMEOUT_SECS, version),
+        EndpointKind::Unix => {
+            Docker::connect_with_unix(&host.endpoint.address, CLIENT_TIMEOUT_SECS, version)
+        }
+        EndpointKind::Http => {
+            Docker::connect_with_http(&host.endpoint.address, CLIENT_TIMEOUT_SECS, version)
+        }
         EndpointKind::Tls => {
             let tls = host
                 .tls
@@ -293,10 +295,7 @@ fn running_container_ids(snapshot: &Snapshot) -> HashSet<String> {
 /// The difference between the containers that should have a stream and the
 /// tasks that currently have one. Both lists are sorted so the reconciliation
 /// is deterministic.
-fn stats_plan(
-    running: &HashSet<String>,
-    active: &HashSet<String>,
-) -> (Vec<String>, Vec<String>) {
+fn stats_plan(running: &HashSet<String>, active: &HashSet<String>) -> (Vec<String>, Vec<String>) {
     let mut start: Vec<String> = running.difference(active).cloned().collect();
     let mut stop: Vec<String> = active.difference(running).cloned().collect();
     start.sort();
@@ -311,7 +310,10 @@ async fn next_sample<S>(
 where
     S: futures_util::Stream<Item = Result<ContainerStatsResponse, bollard::errors::Error>> + Unpin,
 {
-    tokio::time::timeout(timeout, stream.next()).await.ok().flatten()
+    tokio::time::timeout(timeout, stream.next())
+        .await
+        .ok()
+        .flatten()
 }
 
 /// One long-lived stream per running container. The actor aborts this task when
@@ -321,10 +323,8 @@ async fn stats_loop(docker: Docker, id: String, resp_tx: Sender<Response>) {
     let mut backoff_secs = 1u64;
 
     loop {
-        let mut stream = Box::pin(docker.stats(
-            &id,
-            Some(StatsOptionsBuilder::new().stream(true).build()),
-        ));
+        let mut stream =
+            Box::pin(docker.stats(&id, Some(StatsOptionsBuilder::new().stream(true).build())));
 
         loop {
             match next_sample(&mut stream, Duration::from_secs(5)).await {
@@ -409,7 +409,9 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                     reconcile_stats(&docker, &resp_tx, &mut stats_tasks, &running);
                 }
                 Err(err) => {
-                    let _ = resp_tx.send(Response::Status(status_from_error(&err))).await;
+                    let _ = resp_tx
+                        .send(Response::Status(status_from_error(&err)))
+                        .await;
                     let _ = resp_tx
                         .send(Response::Failed {
                             what: "fetch".to_string(),
@@ -424,9 +426,7 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
             }
             Request::Inspect { kind, id } => match inspect(&docker, kind, &id).await {
                 Ok(json) => {
-                    let _ = resp_tx
-                        .send(Response::Inspect { kind, id, json })
-                        .await;
+                    let _ = resp_tx.send(Response::Inspect { kind, id, json }).await;
                 }
                 Err(err) => {
                     let _ = resp_tx
@@ -492,7 +492,10 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                         .force(force)
                         .noprune(false)
                         .build();
-                    docker.remove_image(&id, Some(options), None).await.map(|_| ())
+                    docker
+                        .remove_image(&id, Some(options), None)
+                        .await
+                        .map(|_| ())
                 };
                 spawn_mutation(resp_tx.clone(), target, ActionKind::Remove, epoch, call);
             }
@@ -508,7 +511,11 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                 };
                 spawn_mutation(resp_tx.clone(), target, ActionKind::Remove, epoch, call);
             }
-            Request::PullImage { reference, origin, epoch } => {
+            Request::PullImage {
+                reference,
+                origin,
+                epoch,
+            } => {
                 let docker = docker.clone();
                 let resp_tx = resp_tx.clone();
                 tokio::spawn(async move {
@@ -555,9 +562,10 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                 let docker = docker.clone();
                 let resp_tx = resp_tx.clone();
                 tokio::spawn(async move {
-                    let options = spec.name.as_deref().map(|name| {
-                        CreateContainerOptionsBuilder::new().name(name).build()
-                    });
+                    let options = spec
+                        .name
+                        .as_deref()
+                        .map(|name| CreateContainerOptionsBuilder::new().name(name).build());
                     let body = run_body(&spec);
                     let created = match tokio::time::timeout(
                         Duration::from_secs(30),
@@ -601,7 +609,11 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                     {
                         Ok(Ok(())) => {
                             let _ = resp_tx
-                                .send(Response::ContainerCreated { id, warnings, epoch })
+                                .send(Response::ContainerCreated {
+                                    id,
+                                    warnings,
+                                    epoch,
+                                })
                                 .await;
                         }
                         Ok(Err(err)) => {
@@ -682,16 +694,13 @@ async fn inspect(
     id: &str,
 ) -> Result<serde_json::Value, bollard::errors::Error> {
     let value = match kind {
-        ResourceKind::Container => {
-            serde_json::to_value(docker.inspect_container(id, None).await?)
-                .unwrap_or(serde_json::Value::Null)
-        }
+        ResourceKind::Container => serde_json::to_value(docker.inspect_container(id, None).await?)
+            .unwrap_or(serde_json::Value::Null),
         ResourceKind::Image => {
             serde_json::to_value(docker.inspect_image(id).await?).unwrap_or(serde_json::Value::Null)
         }
-        ResourceKind::Volume => {
-            serde_json::to_value(docker.inspect_volume(id).await?).unwrap_or(serde_json::Value::Null)
-        }
+        ResourceKind::Volume => serde_json::to_value(docker.inspect_volume(id).await?)
+            .unwrap_or(serde_json::Value::Null),
     };
     Ok(value)
 }
@@ -745,7 +754,6 @@ async fn probe_one(host: &HostInfo) -> HostStatus {
         Err(_) => HostStatus::Unreachable("timed out after 300ms".to_string()),
     }
 }
-
 
 /// Subscribes to `/events` and pushes debounced dirty notifications into the UI.
 /// The daemon restarting ends the stream; we mark the host unreachable and
@@ -891,8 +899,9 @@ mod tests {
     fn next_sample_returns_none_when_the_stream_stalls() {
         use bollard::models::ContainerStatsResponse;
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut stream =
-            futures_util::stream::pending::<Result<ContainerStatsResponse, bollard::errors::Error>>();
+        let mut stream = futures_util::stream::pending::<
+            Result<ContainerStatsResponse, bollard::errors::Error>,
+        >();
         let sample = runtime.block_on(next_sample(&mut stream, Duration::from_millis(1)));
         assert!(sample.is_none());
     }

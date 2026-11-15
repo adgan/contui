@@ -143,8 +143,7 @@ impl UsageTotals {
             };
             if let Some(cpu) = sample.cpu_percent {
                 totals.cpu_percent = Some(
-                    totals.cpu_percent.unwrap_or(0.0)
-                        + cpu / sample.online_cpus.max(1) as f32,
+                    totals.cpu_percent.unwrap_or(0.0) + cpu / sample.online_cpus.max(1) as f32,
                 );
                 totals.cpu_reporting += 1;
             }

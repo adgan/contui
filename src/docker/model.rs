@@ -94,12 +94,7 @@ impl ContainerUsage {
         let cpu_stats = sample.cpu_stats.as_ref();
         let online_cpus = cpu_stats.map(online_cpus).unwrap_or(1);
         let cpu_percent = cpu_stats
-            .and_then(|cpu| {
-                sample
-                    .precpu_stats
-                    .as_ref()
-                    .map(|previous| (cpu, previous))
-            })
+            .and_then(|cpu| sample.precpu_stats.as_ref().map(|previous| (cpu, previous)))
             .and_then(|(cpu, previous)| cpu_percent(cpu, previous, online_cpus));
         let memory = sample.memory_stats.as_ref().and_then(memory_usage);
 
@@ -315,7 +310,11 @@ pub fn format_usage_bytes(bytes: u64) -> String {
 pub fn format_memory_pair(usage: u64, limit: Option<u64>) -> String {
     match limit {
         Some(limit) if limit > 0 => {
-            format!("{} / {}", format_usage_bytes(usage), format_usage_bytes(limit))
+            format!(
+                "{} / {}",
+                format_usage_bytes(usage),
+                format_usage_bytes(limit)
+            )
         }
         _ => format_usage_bytes(usage),
     }
@@ -671,7 +670,11 @@ mod tests {
         }
     }
 
-    fn memory_sample(usage: u64, limit: Option<u64>, stats: &[(&str, u64)]) -> ContainerStatsResponse {
+    fn memory_sample(
+        usage: u64,
+        limit: Option<u64>,
+        stats: &[(&str, u64)],
+    ) -> ContainerStatsResponse {
         ContainerStatsResponse {
             memory_stats: Some(ContainerMemoryStats {
                 usage: Some(usage),
@@ -720,9 +723,12 @@ mod tests {
         assert_eq!(v1.memory_usage, Some(800));
         assert_eq!(v1.memory_limit, Some(2_000));
 
-        let v2 =
-            ContainerUsage::from_sample(&memory_sample(1_000, Some(2_000), &[("inactive_file", 300)]))
-                .unwrap();
+        let v2 = ContainerUsage::from_sample(&memory_sample(
+            1_000,
+            Some(2_000),
+            &[("inactive_file", 300)],
+        ))
+        .unwrap();
         assert_eq!(v2.memory_usage, Some(700));
 
         let cache =
