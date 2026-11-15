@@ -2,7 +2,7 @@ use crate::docker::actions::{
     ActionKind, ContainerAction, Proto, RunField, RunForm, Target, build_run_spec,
 };
 use crate::docker::endpoint::{HostInfo, HostStatus, discover};
-use crate::docker::model::{ContainerState, ResourceKind, Snapshot};
+use crate::docker::model::{ContainerState, ContainerUsage, ResourceKind, Snapshot};
 use crate::docker::service::{DockerService, PullOrigin, Request, Response};
 use crate::theme::Theme;
 use crate::ui::detail::DetailState;
@@ -109,6 +109,7 @@ fn reset_host_data(
     snapshot: &mut Snapshot,
     tables: &mut [TableState; 3],
     detail: &mut Option<DetailState>,
+    usage: &mut HashMap<String, ContainerUsage>,
 ) {
     *snapshot = Snapshot::empty();
     for table in tables.iter_mut() {
@@ -117,6 +118,28 @@ fn reset_host_data(
         table.selected = None;
     }
     *detail = None;
+    usage.clear();
+}
+
+/// Live usage is only meaningful while the host is connected; a red host chip
+/// must not sit beside a frozen number.
+fn keeps_usage(status: &HostStatus) -> bool {
+    matches!(status, HostStatus::Connected)
+}
+
+/// Drops samples for containers that stopped or disappeared, so the map only
+/// ever carries running containers.
+fn retain_running_usage(
+    usage: &mut HashMap<String, ContainerUsage>,
+    snapshot: &Snapshot,
+) {
+    let running: HashSet<&str> = snapshot
+        .containers
+        .iter()
+        .filter(|container| container.state == ContainerState::Running)
+        .map(|container| container.id.as_str())
+        .collect();
+    usage.retain(|id, _| running.contains(id.as_str()));
 }
 
 pub struct RootView {
@@ -124,6 +147,7 @@ pub struct RootView {
     pub theme: Theme,
     pub service: Option<DockerService>,
     pub snapshot: Snapshot,
+    pub usage: HashMap<String, ContainerUsage>,
     pub stats: OverviewStats,
     pub status: HostStatus,
     pub hosts: Vec<HostInfo>,
@@ -159,6 +183,7 @@ impl RootView {
             theme: theme.clone(),
             service: None,
             snapshot: Snapshot::empty(),
+            usage: HashMap::new(),
             stats: OverviewStats::default(),
             status: HostStatus::Unknown,
             hosts: discovery.hosts,
@@ -198,7 +223,12 @@ impl RootView {
         self.service = None;
         self._pump = None;
         self.host_menu_open = false;
-        reset_host_data(&mut self.snapshot, &mut self.tables, &mut self.detail);
+        reset_host_data(
+            &mut self.snapshot,
+            &mut self.tables,
+            &mut self.detail,
+            &mut self.usage,
+        );
         self.mutations = Mutations::new();
         self.run_focus = None;
         self.last_error = None;
@@ -216,6 +246,9 @@ impl RootView {
                         };
                         let updated = entity.update(cx, |view, cx| {
                             view.apply(response);
+                            while let Ok(next) = responses.try_recv() {
+                                view.apply(next);
+                            }
                             cx.notify();
                         });
                         if updated.is_err() {
@@ -241,6 +274,7 @@ impl RootView {
             Response::Snapshot(snapshot) => {
                 self.stats = OverviewStats::from_snapshot(&snapshot);
                 self.snapshot = snapshot;
+                retain_running_usage(&mut self.usage, &self.snapshot);
                 self.rebuild_tables();
                 self.last_error = None;
                 if let Some(id) = self.mutations.pending_select.take() {
@@ -275,6 +309,9 @@ impl RootView {
                 }
             }
             Response::Status(status) => {
+                if !keeps_usage(&status) {
+                    self.usage.clear();
+                }
                 let had_work = self.mutations.has_in_flight();
                 if should_refetch_on_status(&self.status, &status) {
                     self.status = status;
@@ -302,7 +339,12 @@ impl RootView {
                     }
                 }
             }
-            Response::Usage { .. } | Response::UsageStale { .. } => {}
+            Response::Usage { id, usage } => {
+                self.usage.insert(id, usage);
+            }
+            Response::UsageStale { id } => {
+                self.usage.remove(&id);
+            }
             Response::Dirty { .. } => {
                 // Keep the open inspect tree on screen while the refetch runs.
                 // Clearing it unmounts the scroll area and jumps the user back
@@ -1178,12 +1220,44 @@ mod tests {
             "alpha-id".into(),
             "alpha".into(),
         ));
+        let mut usage = HashMap::from([("alpha-id".to_string(), ContainerUsage::default())]);
 
-        reset_host_data(&mut snapshot, &mut tables, &mut detail);
+        reset_host_data(&mut snapshot, &mut tables, &mut detail, &mut usage);
 
         assert!(snapshot.containers.is_empty());
         assert!(tables[0].rows.is_empty());
         assert_eq!(tables[0].query, "");
         assert!(detail.is_none());
+        assert!(usage.is_empty());
+    }
+
+    #[test]
+    fn retain_running_usage_drops_stopped_and_missing_containers() {
+        let snapshot = Snapshot {
+            containers: vec![
+                container("alpha", ContainerState::Running),
+                container("beta", ContainerState::Exited),
+            ],
+            ..Snapshot::empty()
+        };
+        let mut usage = HashMap::from([
+            ("alpha-id".to_string(), ContainerUsage::default()),
+            ("beta-id".to_string(), ContainerUsage::default()),
+            ("gone-id".to_string(), ContainerUsage::default()),
+        ]);
+
+        retain_running_usage(&mut usage, &snapshot);
+
+        assert!(usage.contains_key("alpha-id"));
+        assert!(!usage.contains_key("beta-id"));
+        assert!(!usage.contains_key("gone-id"));
+    }
+
+    #[test]
+    fn usage_is_only_kept_while_the_host_is_connected() {
+        assert!(keeps_usage(&HostStatus::Connected));
+        assert!(!keeps_usage(&HostStatus::Unknown));
+        assert!(!keeps_usage(&HostStatus::Unreachable("gone".into())));
+        assert!(!keeps_usage(&HostStatus::AuthFailed("denied".into())));
     }
 }
