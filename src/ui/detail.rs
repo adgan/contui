@@ -2,7 +2,6 @@ use crate::docker::model::{LogLine, ResourceKind};
 use crate::theme::Theme;
 use gpui::prelude::*;
 use gpui::{IntoElement, SharedString, div, px};
-use gpui::UniformListScrollHandle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DetailTab {
@@ -21,7 +20,6 @@ pub struct DetailState {
     pub logs_requested: bool,
     pub missing: bool,
     pub error: Option<String>,
-    pub scroll: UniformListScrollHandle,
 }
 
 impl DetailState {
@@ -47,7 +45,6 @@ impl DetailState {
             logs_requested: false,
             missing: false,
             error: None,
-            scroll: UniformListScrollHandle::new(),
         }
     }
 }

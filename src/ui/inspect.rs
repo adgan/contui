@@ -47,7 +47,7 @@ fn build_node(key: &str, value: &Value, max_depth: usize, depth: usize) -> Inspe
         }
         other => InspectNode {
             key: key.to_string().into(),
-            value: Some(clip(summarize(other))).into(),
+            value: Some(clip(summarize(other))),
             children: Vec::new(),
         },
     }

@@ -18,6 +18,14 @@ impl ActionsColumn {
         }
     }
 
+    pub fn for_kind(kind: ResourceKind) -> Self {
+        match kind {
+            ResourceKind::Container => ActionsColumn::Container,
+            ResourceKind::Image => ActionsColumn::Image,
+            ResourceKind::Volume => ActionsColumn::Volume,
+        }
+    }
+
     pub fn kind(self) -> ResourceKind {
         match self {
             ActionsColumn::Container => ResourceKind::Container,
@@ -192,10 +200,10 @@ impl TableState {
             });
         }
 
-        if let Some(selected) = self.selected {
-            if !indices.contains(&selected) {
-                self.selected = indices.last().copied();
-            }
+        if let Some(selected) = self.selected
+            && !indices.contains(&selected)
+        {
+            self.selected = indices.last().copied();
         }
 
         self.cached = indices;

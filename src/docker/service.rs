@@ -93,7 +93,6 @@ pub enum Response {
         lines: Vec<LogLine>,
     },
     Dirty {
-        kinds: Vec<ResourceKind>,
         ids: Vec<(ResourceKind, String)>,
     },
     Failed {
@@ -186,10 +185,6 @@ impl DockerService {
     pub fn request(&self, req: Request) {
         let _ = self.cmd_tx.try_send(req);
     }
-
-    pub fn shutdown(mut self) {
-        self.runtime.take();
-    }
 }
 
 impl Drop for DockerService {
@@ -234,6 +229,47 @@ fn mutation_error(
         Ok(Err(err)) => Some(clean_error(&err)),
         Err(_) => Some("timed out after 30s".to_string()),
     }
+}
+
+/// Runs one daemon mutation off the actor loop and reports exactly one
+/// `ActionDone`, whether the call succeeded, failed or timed out.
+fn spawn_mutation<F>(
+    resp_tx: Sender<Response>,
+    target: Target,
+    action: ActionKind,
+    epoch: u64,
+    call: F,
+) where
+    F: std::future::Future<Output = Result<(), bollard::errors::Error>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let error = mutation_error(tokio::time::timeout(Duration::from_secs(30), call).await);
+        let _ = resp_tx
+            .send(Response::ActionDone {
+                target,
+                action,
+                error,
+                epoch,
+            })
+            .await;
+    });
+}
+
+async fn send_run_failed(
+    resp_tx: &Sender<Response>,
+    message: String,
+    missing_image: bool,
+    created: Option<String>,
+    epoch: u64,
+) {
+    let _ = resp_tx
+        .send(Response::RunFailed {
+            message,
+            missing_image,
+            created,
+            epoch,
+        })
+        .await;
 }
 
 async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Response>) {
@@ -292,127 +328,63 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                         .await;
                 }
             },
-            // Implemented in the next step of this task.
             Request::ContainerAction { id, action, epoch } => {
                 let docker = docker.clone();
-                let resp_tx = resp_tx.clone();
-                tokio::spawn(async move {
-                    let kind = ActionKind::for_container(action);
-                    let target = Target {
-                        kind: ResourceKind::Container,
-                        id: id.clone(),
-                    };
-                    let call = async {
-                        match action {
-                            ContainerAction::Start => docker.start_container(&id, None).await,
-                            ContainerAction::Stop => {
-                                docker.stop_container(&id, Some(stop_options())).await
-                            }
-                            ContainerAction::Restart => docker.restart_container(&id, None).await,
+                let kind = ActionKind::for_container(action);
+                let target = Target {
+                    kind: ResourceKind::Container,
+                    id: id.clone(),
+                };
+                let call = async move {
+                    match action {
+                        ContainerAction::Start => docker.start_container(&id, None).await,
+                        ContainerAction::Stop => {
+                            docker.stop_container(&id, Some(stop_options())).await
                         }
-                    };
-                    let error = mutation_error(
-                        tokio::time::timeout(Duration::from_secs(30), call).await,
-                    );
-                    let _ = resp_tx
-                        .send(Response::ActionDone {
-                            target,
-                            action: kind,
-                            error,
-                            epoch,
-                        })
-                        .await;
-                });
+                        ContainerAction::Restart => docker.restart_container(&id, None).await,
+                    }
+                };
+                spawn_mutation(resp_tx.clone(), target, kind, epoch, call);
             }
             Request::RemoveContainer { id, force, epoch } => {
                 let docker = docker.clone();
-                let resp_tx = resp_tx.clone();
-                tokio::spawn(async move {
-                    let target = Target {
-                        kind: ResourceKind::Container,
-                        id: id.clone(),
-                    };
-                    let error = mutation_error(
-                        tokio::time::timeout(
-                            Duration::from_secs(30),
-                            docker.remove_container(&id, Some(remove_container_options(force))),
-                        )
-                        .await,
-                    );
-                    let _ = resp_tx
-                        .send(Response::ActionDone {
-                            target,
-                            action: ActionKind::Remove,
-                            error,
-                            epoch,
-                        })
-                        .await;
-                });
+                let target = Target {
+                    kind: ResourceKind::Container,
+                    id: id.clone(),
+                };
+                let call = async move {
+                    docker
+                        .remove_container(&id, Some(remove_container_options(force)))
+                        .await
+                };
+                spawn_mutation(resp_tx.clone(), target, ActionKind::Remove, epoch, call);
             }
             Request::RemoveImage { id, force, epoch } => {
                 let docker = docker.clone();
-                let resp_tx = resp_tx.clone();
-                tokio::spawn(async move {
-                    let target = Target {
-                        kind: ResourceKind::Image,
-                        id: id.clone(),
-                    };
-                    let error = match tokio::time::timeout(
-                        Duration::from_secs(30),
-                        docker.remove_image(
-                            &id,
-                            Some(
-                                RemoveImageOptionsBuilder::new()
-                                    .force(force)
-                                    .noprune(false)
-                                    .build(),
-                            ),
-                            None,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => None,
-                        Ok(Err(err)) => Some(clean_error(&err)),
-                        Err(_) => Some("timed out after 30s".to_string()),
-                    };
-                    let _ = resp_tx
-                        .send(Response::ActionDone {
-                            target,
-                            action: ActionKind::Remove,
-                            error,
-                            epoch,
-                        })
-                        .await;
-                });
+                let target = Target {
+                    kind: ResourceKind::Image,
+                    id: id.clone(),
+                };
+                let call = async move {
+                    let options = RemoveImageOptionsBuilder::new()
+                        .force(force)
+                        .noprune(false)
+                        .build();
+                    docker.remove_image(&id, Some(options), None).await.map(|_| ())
+                };
+                spawn_mutation(resp_tx.clone(), target, ActionKind::Remove, epoch, call);
             }
             Request::RemoveVolume { name, epoch } => {
                 let docker = docker.clone();
-                let resp_tx = resp_tx.clone();
-                tokio::spawn(async move {
-                    let target = Target {
-                        kind: ResourceKind::Volume,
-                        id: name.clone(),
-                    };
-                    let error = mutation_error(
-                        tokio::time::timeout(
-                            Duration::from_secs(30),
-                            docker.remove_volume(
-                                &name,
-                                Some(RemoveVolumeOptionsBuilder::new().force(false).build()),
-                            ),
-                        )
-                        .await,
-                    );
-                    let _ = resp_tx
-                        .send(Response::ActionDone {
-                            target,
-                            action: ActionKind::Remove,
-                            error,
-                            epoch,
-                        })
-                        .await;
-                });
+                let target = Target {
+                    kind: ResourceKind::Volume,
+                    id: name.clone(),
+                };
+                let call = async move {
+                    let options = RemoveVolumeOptionsBuilder::new().force(false).build();
+                    docker.remove_volume(&name, Some(options)).await
+                };
+                spawn_mutation(resp_tx.clone(), target, ActionKind::Remove, epoch, call);
             }
             Request::PullImage { reference, origin, epoch } => {
                 let docker = docker.clone();
@@ -420,41 +392,11 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                 tokio::spawn(async move {
                     let mut stream =
                         docker.create_image(Some(pull_options(&reference)), None, None);
-                    loop {
+                    let error = loop {
                         match tokio::time::timeout(Duration::from_secs(60), stream.next()).await {
-                            Err(_) => {
-                                let _ = resp_tx
-                                    .send(Response::PullDone {
-                                        origin,
-                                        reference,
-                                        error: Some("pull stalled for 60s".to_string()),
-                                        epoch,
-                                    })
-                                    .await;
-                                return;
-                            }
-                            Ok(None) => {
-                                let _ = resp_tx
-                                    .send(Response::PullDone {
-                                        origin,
-                                        reference,
-                                        error: None,
-                                        epoch,
-                                    })
-                                    .await;
-                                return;
-                            }
-                            Ok(Some(Err(err))) => {
-                                let _ = resp_tx
-                                    .send(Response::PullDone {
-                                        origin,
-                                        reference,
-                                        error: Some(clean_error(&err)),
-                                        epoch,
-                                    })
-                                    .await;
-                                return;
-                            }
+                            Err(_) => break Some("pull stalled for 60s".to_string()),
+                            Ok(None) => break None,
+                            Ok(Some(Err(err))) => break Some(clean_error(&err)),
                             Ok(Some(Ok(info))) => {
                                 let detail = info.progress_detail.and_then(|progress| {
                                     match (progress.current, progress.total) {
@@ -476,7 +418,15 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                                     .await;
                             }
                         }
-                    }
+                    };
+                    let _ = resp_tx
+                        .send(Response::PullDone {
+                            origin,
+                            reference,
+                            error,
+                            epoch,
+                        })
+                        .await;
                 });
             }
             Request::RunContainer { spec, epoch } => {
@@ -496,25 +446,25 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                         Ok(Ok(response)) => response,
                         Ok(Err(err)) => {
                             let failure = classify_run_error(&err, None);
-                            let _ = resp_tx
-                                .send(Response::RunFailed {
-                                    message: failure.message,
-                                    missing_image: failure.missing_image,
-                                    created: None,
-                                    epoch,
-                                })
-                                .await;
+                            send_run_failed(
+                                &resp_tx,
+                                failure.message,
+                                failure.missing_image,
+                                None,
+                                epoch,
+                            )
+                            .await;
                             return;
                         }
                         Err(_) => {
-                            let _ = resp_tx
-                                .send(Response::RunFailed {
-                                    message: "timed out after 30s".to_string(),
-                                    missing_image: false,
-                                    created: None,
-                                    epoch,
-                                })
-                                .await;
+                            send_run_failed(
+                                &resp_tx,
+                                "timed out after 30s".to_string(),
+                                false,
+                                None,
+                                epoch,
+                            )
+                            .await;
                             return;
                         }
                     };
@@ -534,24 +484,24 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                         }
                         Ok(Err(err)) => {
                             let failure = classify_run_error(&err, Some(id.clone()));
-                            let _ = resp_tx
-                                .send(Response::RunFailed {
-                                    message: failure.message,
-                                    missing_image: failure.missing_image,
-                                    created: Some(id),
-                                    epoch,
-                                })
-                                .await;
+                            send_run_failed(
+                                &resp_tx,
+                                failure.message,
+                                failure.missing_image,
+                                Some(id),
+                                epoch,
+                            )
+                            .await;
                         }
                         Err(_) => {
-                            let _ = resp_tx
-                                .send(Response::RunFailed {
-                                    message: "created but did not start within 30s".to_string(),
-                                    missing_image: false,
-                                    created: Some(id),
-                                    epoch,
-                                })
-                                .await;
+                            send_run_failed(
+                                &resp_tx,
+                                "created but did not start within 30s".to_string(),
+                                false,
+                                Some(id),
+                                epoch,
+                            )
+                            .await;
                         }
                     }
                 });
@@ -714,8 +664,8 @@ async fn event_loop(docker: Docker, resp_tx: Sender<Response>) {
                     Some(Err(_)) | None => break,
                 },
                 _ = ticker.tick() => {
-                    if let Some((kinds, ids)) = debouncer.take_if_due(std::time::Instant::now()) {
-                        let _ = resp_tx.try_send(Response::Dirty { kinds, ids });
+                    if let Some(ids) = debouncer.take_if_due(std::time::Instant::now()) {
+                        let _ = resp_tx.try_send(Response::Dirty { ids });
                     }
                 }
             }
