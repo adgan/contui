@@ -7,8 +7,8 @@ use crate::docker::endpoint::{
 };
 use crate::docker::events::Debouncer;
 use crate::docker::model::{
-    parse_logs, status_from_error, ContainerRow, ImageRow, LogLine, ResourceKind, Snapshot,
-    VolumeRow,
+    parse_logs, status_from_error, ContainerRow, ContainerStats, ImageRow, LogLine, ResourceKind,
+    Snapshot, VolumeRow,
 };
 use async_channel::{Receiver, Sender};
 use bollard::Docker;
@@ -16,15 +16,16 @@ use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, CreateImageOptionsBuilder,
     ListContainersOptionsBuilder, ListImagesOptionsBuilder, ListVolumesOptionsBuilder,
     LogsOptionsBuilder, RemoveContainerOptions, RemoveContainerOptionsBuilder,
-    RemoveImageOptionsBuilder, RemoveVolumeOptionsBuilder, StopContainerOptions,
-    StopContainerOptionsBuilder,
+    RemoveImageOptionsBuilder, RemoveVolumeOptionsBuilder, StatsOptionsBuilder,
+    StopContainerOptions, StopContainerOptionsBuilder,
 };
 use chrono::Utc;
 use futures_util::{join, StreamExt};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
 
 /// Bollard's connection timeout is a per-read/write socket timeout, not a
 /// connect timeout. It must outlast Docker's 10s stop grace and the 60s pull
@@ -75,6 +76,10 @@ pub enum Request {
     RunContainer {
         spec: RunSpec,
         epoch: u64,
+    },
+    /// The exact set of containers whose stats the UI can currently show.
+    WatchStats {
+        ids: Vec<String>,
     },
 }
 
@@ -130,6 +135,10 @@ pub enum Response {
         created: Option<String>,
         epoch: u64,
     },
+    Stats {
+        id: String,
+        stats: ContainerStats,
+    },
 }
 
 pub fn remove_container_options(force: bool) -> RemoveContainerOptions {
@@ -141,6 +150,18 @@ pub fn remove_container_options(force: bool) -> RemoveContainerOptions {
 
 pub fn stop_options() -> StopContainerOptions {
     StopContainerOptionsBuilder::new().t(10).build()
+}
+
+/// Docker's stats stream emits once a second; the UI only needs a reading
+/// every two. The stream stays open either way.
+const STATS_UI_INTERVAL: Duration = Duration::from_secs(2);
+
+pub fn stats_options() -> bollard::query_parameters::StatsOptions {
+    StatsOptionsBuilder::new().stream(true).one_shot(false).build()
+}
+
+fn stats_sample_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_none_or(|last| now.duration_since(last) >= STATS_UI_INTERVAL)
 }
 
 pub fn pull_options(reference: &str) -> CreateImageOptions {
@@ -189,7 +210,11 @@ impl DockerService {
 
 impl Drop for DockerService {
     fn drop(&mut self) {
-        self.runtime.take();
+        if let Some(runtime) = self.runtime.take() {
+            // Cancels the actor, the event loop and every stats stream. The
+            // timeout bounds a host switch or quit when a stream is stuck.
+            runtime.shutdown_timeout(Duration::from_millis(500));
+        }
     }
 }
 
@@ -280,6 +305,8 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
     };
     let _ = resp_tx.send(Response::Status(status)).await;
 
+    let mut stats_tasks: HashMap<String, JoinHandle<()>> = HashMap::new();
+
     while let Ok(req) = cmd_rx.recv().await {
         match req {
             Request::FetchAll => match fetch_all(&docker).await {
@@ -299,6 +326,23 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
             Request::ProbeHosts => {
                 let statuses = probe_hosts().await;
                 let _ = resp_tx.send(Response::HostStatuses(statuses)).await;
+            }
+            Request::WatchStats { ids } => {
+                let desired: HashSet<String> = ids.into_iter().collect();
+                stats_tasks.retain(|id, handle| {
+                    let keep = desired.contains(id) && !handle.is_finished();
+                    if !keep {
+                        handle.abort();
+                    }
+                    keep
+                });
+                for id in desired {
+                    if stats_tasks.contains_key(&id) {
+                        continue;
+                    }
+                    let task = tokio::spawn(stats_task(docker.clone(), id.clone(), resp_tx.clone()));
+                    stats_tasks.insert(id, task);
+                }
             }
             Request::Inspect { kind, id } => match inspect(&docker, kind, &id).await {
                 Ok(json) => {
@@ -507,6 +551,43 @@ async fn actor(docker: Docker, cmd_rx: Receiver<Request>, resp_tx: Sender<Respon
                 });
             }
         }
+    }
+}
+
+/// One stats stream per watched container. Docker sends a frame per second;
+/// only every other usable frame reaches the UI. A broken stream is retried
+/// with backoff and only stops when the actor aborts the task.
+async fn stats_task(docker: Docker, id: String, resp_tx: Sender<Response>) {
+    let mut backoff_secs: u64 = 1;
+    loop {
+        let mut stream = Box::pin(docker.stats(&id, Some(stats_options())));
+        let mut last_sent: Option<std::time::Instant> = None;
+        while let Some(item) = stream.next().await {
+            let frame = match item {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            let Some(stats) = ContainerStats::from_response(&frame) else {
+                continue;
+            };
+            let now = std::time::Instant::now();
+            if !stats_sample_due(last_sent, now) {
+                continue;
+            }
+            if resp_tx
+                .send(Response::Stats {
+                    id: id.clone(),
+                    stats,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            last_sent = Some(now);
+        }
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(5);
     }
 }
 
@@ -722,5 +803,26 @@ mod tests {
             }
             other => panic!("expected AuthFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stats_options_stream_and_do_not_one_shot() {
+        let options = stats_options();
+        assert!(options.stream);
+        assert!(!options.one_shot);
+    }
+
+    #[test]
+    fn stats_ui_samples_wait_two_seconds() {
+        let now = std::time::Instant::now();
+        assert!(stats_sample_due(None, now));
+        assert!(!stats_sample_due(
+            Some(now),
+            now + std::time::Duration::from_millis(1_999)
+        ));
+        assert!(stats_sample_due(
+            Some(now),
+            now + std::time::Duration::from_secs(2)
+        ));
     }
 }
