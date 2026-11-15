@@ -2174,9 +2174,14 @@ impl RootView {
 
 trait MapWidth: Styled + Sized {
     fn map_width(self, width: ColumnWidth) -> Self {
-        match width {
-            ColumnWidth::Fixed(value) => self.w(px(value)).flex_shrink_0(),
-            ColumnWidth::Flex(_weight) => self.flex_grow().min_w(px(0.)),
+        let layout = crate::ui::table::column_layout(width);
+        match layout.fixed {
+            Some(value) => self.w(px(value)).flex_shrink_0(),
+            None => {
+                let mut styled = self.min_w(px(0.)).flex_basis(px(0.));
+                styled.style().flex_grow = Some(layout.grow);
+                styled
+            }
         }
     }
 }

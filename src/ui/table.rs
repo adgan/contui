@@ -41,8 +41,29 @@ pub enum ColumnWidth {
     Flex(f32),
 }
 
-/// How one data column renders. Pills are used for live container state;
-/// the cell text still drives filtering and sorting.
+/// How a declared width becomes flex geometry: fixed pixels, or a grow weight
+/// used with a zero basis so every row divides the leftover space the same way.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColumnLayout {
+    pub fixed: Option<f32>,
+    pub grow: f32,
+}
+
+pub fn column_layout(width: ColumnWidth) -> ColumnLayout {
+    match width {
+        ColumnWidth::Fixed(value) => ColumnLayout {
+            fixed: Some(value),
+            grow: 0.0,
+        },
+        ColumnWidth::Flex(weight) => ColumnLayout {
+            fixed: None,
+            grow: weight,
+        },
+    }
+}
+
+/// How one data column renders. Pills are used for live container state; the
+/// cell text still drives filtering and sorting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellStyle {
     Text,
@@ -467,5 +488,20 @@ mod tests {
         let mut fresh = TableState::new(spec());
         fresh.adopt_state(&previous);
         assert!(std::rc::Rc::ptr_eq(&fresh.scroll.0, &previous.scroll.0));
+    }
+
+    #[test]
+    fn column_layout_fixes_fixed_columns_and_weights_flex_columns() {
+        assert_eq!(
+            column_layout(ColumnWidth::Fixed(104.0)),
+            ColumnLayout {
+                fixed: Some(104.0),
+                grow: 0.0
+            }
+        );
+        let flex = column_layout(ColumnWidth::Flex(2.2));
+        assert_eq!(flex.fixed, None);
+        assert_eq!(flex.grow, 2.2);
+        assert_eq!(column_layout(ColumnWidth::Flex(1.0)).grow, 1.0);
     }
 }
