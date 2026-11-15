@@ -83,6 +83,11 @@ jobs:
         with:
           name: formula-base
           path: dist
+      - name: Fetch the published source tarball
+        # check-artifacts.sh holds the tarball and the bottle against each other, and the
+        # tarball only exists as a release asset. Without it the check fails on its first
+        # assertion, long before it can say anything about the bundle.
+        run: gh release download "v$VERSION" --pattern "contui-*.tar.gz" --dir dist
       - name: Build bottle
         run: scripts/build-bottle.sh "$VERSION" dist
       - name: Check the artifacts a user actually gets
