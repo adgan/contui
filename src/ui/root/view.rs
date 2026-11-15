@@ -2852,3 +2852,75 @@ impl Render for RootView {
         root
     }
 }
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn row(name: &'static str, tag: &'static str) -> Div {
+        div()
+            .w(px(700.))
+            .flex()
+            .items_center()
+            .child(div().map_width(ColumnWidth::Flex(2.2)).child(name))
+            .child(
+                div()
+                    .map_width(ColumnWidth::Fixed(104.))
+                    .debug_selector(move || format!("{tag}-state"))
+                    .child("running"),
+            )
+            .child(div().map_width(ColumnWidth::Flex(2.0)).child("postgres:18"))
+    }
+
+    struct Rows;
+
+    impl Render for Rows {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().flex().flex_col().child(row("short", "short")).child(row(
+                "k8s_helm_helm-install-traefik-crd-4l4f2_kube-system_aaaaaaaaaaaaaaaaaaaa",
+                "long",
+            ))
+        }
+    }
+
+    #[gpui::test]
+    fn columns_do_not_depend_on_the_cell_text(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_window, _cx| Rows);
+        cx.run_until_parked();
+
+        let short = cx.debug_bounds("short-state").expect("short row laid out");
+        let long = cx.debug_bounds("long-state").expect("long row laid out");
+        let drift = (f32::from(short.origin.x) - f32::from(long.origin.x)).abs();
+        assert!(drift < 0.5, "state column drifted by {drift}px with content");
+    }
+
+    struct Clamped;
+
+    impl Render for Clamped {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(120.)).flex().child(
+                div()
+                    .line_clamp(2)
+                    .text_ellipsis()
+                    .text_size(px(13.))
+                    .line_height(px(18.))
+                    .debug_selector(|| "clamped".to_string())
+                    .child("k8s_helm_helm-install-traefik-crd-4l4f2_kube-system_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_long_first_column_takes_two_lines(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_window, _cx| Clamped);
+        cx.run_until_parked();
+
+        let bounds = cx.debug_bounds("clamped").expect("clamped cell laid out");
+        let height = f32::from(bounds.size.height);
+        assert!(
+            (height - 36.0).abs() < 1.0,
+            "expected two 18px lines, got {height}px"
+        );
+    }
+}
