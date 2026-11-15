@@ -8,7 +8,7 @@ use crate::ui::detail::{DetailTab, render_logs};
 use crate::ui::inspect::InspectNode;
 use crate::ui::mutations::RowMenuState;
 use crate::ui::style::Layout;
-use crate::ui::table::{CellStyle, ColumnWidth};
+use crate::ui::table::{CellStyle, ColumnWidth, cell_wraps};
 use crate::ui::widgets::button::{ButtonSpec, button};
 use crate::ui::widgets::pill::{state_pill, state_pill_inline};
 use crate::ui::widgets::stat_card::{StatCard, stat_card};
@@ -2026,7 +2026,15 @@ impl RootView {
                             continue;
                         }
 
-                        let mut text = div().map_width(width).truncate().child(cell.clone());
+                        let mut text = div()
+                            .id(SharedString::from(format!("cell-{row_id}-{column}")))
+                            .map_width(width);
+                        if cell_wraps(column, style) {
+                            text = text.line_clamp(2).text_ellipsis();
+                        } else {
+                            text = text.truncate();
+                        }
+                        text = text.child(cell.clone());
                         match style {
                             CellStyle::Text => {
                                 text = text

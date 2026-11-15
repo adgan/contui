@@ -74,6 +74,13 @@ pub enum CellStyle {
     Memory,
 }
 
+/// The first text column — container name, image repository, volume name — is
+/// the only cell allowed to wrap. Everything else stays a single ellipsized
+/// line so row heights stay uniform.
+pub fn cell_wraps(column: usize, style: CellStyle) -> bool {
+    column == 0 && style == CellStyle::Text
+}
+
 #[derive(Clone, Debug)]
 pub struct TableSpec {
     pub id: &'static str,
@@ -503,5 +510,14 @@ mod tests {
         assert_eq!(flex.fixed, None);
         assert_eq!(flex.grow, 2.2);
         assert_eq!(column_layout(ColumnWidth::Flex(1.0)).grow, 1.0);
+    }
+
+    #[test]
+    fn only_the_first_text_column_wraps() {
+        assert!(cell_wraps(0, CellStyle::Text));
+        assert!(!cell_wraps(0, CellStyle::Mono));
+        assert!(!cell_wraps(0, CellStyle::Timestamp));
+        assert!(!cell_wraps(0, CellStyle::Pill));
+        assert!(!cell_wraps(1, CellStyle::Text));
     }
 }
