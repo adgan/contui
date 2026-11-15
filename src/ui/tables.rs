@@ -1,14 +1,21 @@
-use crate::docker::model::{ContainerState, Snapshot};
+use crate::docker::model::{
+    format_cpu, format_memory, ContainerState, ContainerStats, Snapshot,
+};
 use crate::ui::table::{
     ActionsColumn, CellStyle, ColumnWidth, SortValue, TableRow, TableSpec, TableState,
 };
 use crate::ui::widgets::pill::state_label;
+use std::collections::HashMap;
 
 /// Builds the three list tables from a snapshot, carrying the user's query,
 /// sort and selection from `previous` onto the fresh rows.
-pub fn tables_from(snapshot: &Snapshot, previous: &[TableState; 3]) -> [TableState; 3] {
+pub fn tables_from(
+    snapshot: &Snapshot,
+    stats: &HashMap<String, ContainerStats>,
+    previous: &[TableState; 3],
+) -> [TableState; 3] {
     let mut next = [
-        containers_table(snapshot),
+        containers_table(snapshot, stats),
         images_table(snapshot),
         volumes_table(snapshot),
     ];
@@ -18,20 +25,27 @@ pub fn tables_from(snapshot: &Snapshot, previous: &[TableState; 3]) -> [TableSta
     next
 }
 
-pub fn containers_table(snapshot: &Snapshot) -> TableState {
+pub fn containers_table(
+    snapshot: &Snapshot,
+    stats: &HashMap<String, ContainerStats>,
+) -> TableState {
     let spec = TableSpec {
         id: "containers-table",
-        columns: vec!["Name", "State", "Image", "Ports", "Created"],
+        columns: vec!["Name", "State", "CPU", "MEM", "Image", "Ports", "Created"],
         widths: vec![
-            ColumnWidth::Flex(2.2),
-            ColumnWidth::Fixed(104.0),
             ColumnWidth::Flex(2.0),
-            ColumnWidth::Fixed(132.0),
             ColumnWidth::Fixed(100.0),
+            ColumnWidth::Fixed(62.0),
+            ColumnWidth::Fixed(120.0),
+            ColumnWidth::Flex(1.8),
+            ColumnWidth::Fixed(120.0),
+            ColumnWidth::Fixed(96.0),
         ],
         styles: vec![
             CellStyle::Text,
             CellStyle::Pill,
+            CellStyle::Cpu,
+            CellStyle::Memory,
             CellStyle::Mono,
             CellStyle::Mono,
             CellStyle::Timestamp,
@@ -50,22 +64,31 @@ pub fn containers_table(snapshot: &Snapshot) -> TableState {
 
     let rows = sorted
         .into_iter()
-        .map(|c| TableRow {
-            id: c.id.clone(),
-            cells: vec![
-                c.name.clone(),
-                state_label(c.state).into(),
-                c.image.clone(),
-                c.ports.clone(),
-                c.created_label.clone(),
-            ],
-            sort_values: vec![
-                SortValue::Text(c.name.to_string()),
-                SortValue::Text(state_label(c.state).to_string()),
-                SortValue::Text(c.image.to_string()),
-                SortValue::Text(c.ports.to_string()),
-                SortValue::Time(c.created),
-            ],
+        .map(|c| {
+            let container_stats = stats.get(&c.id).copied();
+            let cpu = container_stats.and_then(|stats| stats.cpu_percent);
+            let memory = container_stats.and_then(|stats| stats.memory);
+            TableRow {
+                id: c.id.clone(),
+                cells: vec![
+                    c.name.clone(),
+                    state_label(c.state).into(),
+                    format_cpu(cpu).unwrap_or_else(|| "—".into()).into(),
+                    format_memory(memory).unwrap_or_else(|| "—".into()).into(),
+                    c.image.clone(),
+                    c.ports.clone(),
+                    c.created_label.clone(),
+                ],
+                sort_values: vec![
+                    SortValue::Text(c.name.to_string()),
+                    SortValue::Text(state_label(c.state).to_string()),
+                    SortValue::Number(cpu.map(|p| (p * 10.0).round() as i64).unwrap_or(-1)),
+                    SortValue::Number(memory.map(|m| m.used as i64).unwrap_or(-1)),
+                    SortValue::Text(c.image.to_string()),
+                    SortValue::Text(c.ports.to_string()),
+                    SortValue::Time(c.created),
+                ],
+            }
         })
         .collect();
 
@@ -173,9 +196,12 @@ pub fn volumes_table(snapshot: &Snapshot) -> TableState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::docker::model::{ContainerRow, ImageRow, Snapshot, VolumeRow};
+    use crate::docker::model::{
+        ContainerRow, ContainerStats, ImageRow, MemoryUsage, Snapshot, VolumeRow,
+    };
     use chrono::{DateTime, Utc};
     use gpui::SharedString;
+    use std::collections::HashMap;
 
     fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).unwrap()
@@ -222,7 +248,7 @@ mod tests {
     fn each_table_declares_its_action_column() {
         let snapshot = Snapshot::empty();
         assert_eq!(
-            containers_table(&snapshot).spec.actions,
+            containers_table(&snapshot, &HashMap::new()).spec.actions,
             Some(ActionsColumn::Container)
         );
         assert_eq!(
@@ -248,7 +274,7 @@ mod tests {
             ],
             ..Snapshot::empty()
         };
-        let table = containers_table(&snapshot);
+        let table = containers_table(&snapshot, &HashMap::new());
         let names: Vec<&str> = table
             .visible()
             .iter()
@@ -301,7 +327,7 @@ mod tests {
             ..Snapshot::empty()
         };
         let mut previous = [
-            containers_table(&snapshot),
+            containers_table(&snapshot, &HashMap::new()),
             images_table(&snapshot),
             volumes_table(&snapshot),
         ];
@@ -309,7 +335,7 @@ mod tests {
         previous[0].click_header(0);
         previous[0].selected = Some(0);
 
-        let next = tables_from(&snapshot, &previous);
+        let next = tables_from(&snapshot, &HashMap::new(), &previous);
         assert_eq!(next[0].query, "alpha");
         assert_eq!(next[0].sort, Some((0, true)));
         assert!(next[0].visible().len() <= 1);
@@ -317,11 +343,82 @@ mod tests {
 
     #[test]
     fn empty_snapshot_produces_empty_tables_with_headers() {
-        let table = containers_table(&Snapshot::empty());
+        let table = containers_table(&Snapshot::empty(), &HashMap::new());
         assert!(table.visible().is_empty());
         assert_eq!(
             table.spec.columns,
-            vec!["Name", "State", "Image", "Ports", "Created"]
+            vec!["Name", "State", "CPU", "MEM", "Image", "Ports", "Created"]
         );
+    }
+
+    #[test]
+    fn containers_table_has_cpu_and_memory_columns() {
+        let table = containers_table(&Snapshot::empty(), &HashMap::new());
+        assert_eq!(
+            table.spec.columns,
+            vec!["Name", "State", "CPU", "MEM", "Image", "Ports", "Created"]
+        );
+    }
+
+    #[test]
+    fn running_rows_show_stats_and_stopped_rows_show_dashes() {
+        let snapshot = Snapshot {
+            containers: vec![
+                container("web", ContainerState::Running),
+                container("job", ContainerState::Exited),
+            ],
+            ..Snapshot::empty()
+        };
+        let stats = HashMap::from([(
+            "web-id".to_string(),
+            ContainerStats {
+                cpu_percent: Some(12.34),
+                memory: Some(MemoryUsage {
+                    used: 432_013_312,
+                    limit: 2_147_483_648,
+                    percent: Some(20.1),
+                }),
+            },
+        )]);
+        let table = containers_table(&snapshot, &stats);
+        let web = table
+            .rows
+            .iter()
+            .find(|r| r.cells[0].as_ref() == "web")
+            .unwrap();
+        let job = table
+            .rows
+            .iter()
+            .find(|r| r.cells[0].as_ref() == "job")
+            .unwrap();
+        assert_eq!(web.cells[2].as_ref(), "12.3%");
+        assert_eq!(web.cells[3].as_ref(), "412 MB / 2.0 GB");
+        assert!(matches!(web.sort_values[2], SortValue::Number(123)));
+        assert!(matches!(web.sort_values[3], SortValue::Number(432_013_312)));
+        assert_eq!(job.cells[2].as_ref(), "—");
+        assert_eq!(job.cells[3].as_ref(), "—");
+        assert!(matches!(job.sort_values[2], SortValue::Number(-1)));
+    }
+
+    #[test]
+    fn memory_only_rows_leave_cpu_missing() {
+        let snapshot = Snapshot {
+            containers: vec![container("web", ContainerState::Running)],
+            ..Snapshot::empty()
+        };
+        let stats = HashMap::from([(
+            "web-id".to_string(),
+            ContainerStats {
+                cpu_percent: None,
+                memory: Some(MemoryUsage {
+                    used: 1_048_576,
+                    limit: 0,
+                    percent: None,
+                }),
+            },
+        )]);
+        let table = containers_table(&snapshot, &stats);
+        assert_eq!(table.rows[0].cells[2].as_ref(), "—");
+        assert_eq!(table.rows[0].cells[3].as_ref(), "1.0 MB");
     }
 }

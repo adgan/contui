@@ -164,7 +164,7 @@ impl RootView {
             hosts: discovery.hosts,
             active_host: discovery.active,
             tables: [
-                crate::ui::tables::containers_table(&empty),
+                crate::ui::tables::containers_table(&empty, &HashMap::new()),
                 crate::ui::tables::images_table(&empty),
                 crate::ui::tables::volumes_table(&empty),
             ],
@@ -426,7 +426,8 @@ impl RootView {
     }
 
     fn rebuild_tables(&mut self) {
-        self.tables = crate::ui::tables::tables_from(&self.snapshot, &self.tables);
+        self.tables =
+            crate::ui::tables::tables_from(&self.snapshot, &HashMap::new(), &self.tables);
     }
 
     pub fn switch_page(&mut self, page: Page) {
@@ -1058,7 +1059,7 @@ mod tests {
             ],
             ..Snapshot::empty()
         };
-        let table = crate::ui::tables::containers_table(&snapshot);
+        let table = crate::ui::tables::containers_table(&snapshot, &HashMap::new());
         let slots = compose_slots(&table, &snapshot.containers, &HashSet::new(), false).unwrap();
 
         let groups: Vec<(&str, usize, usize)> = slots
@@ -1123,7 +1124,7 @@ mod tests {
             containers: vec![container("plain", ContainerState::Running)],
             ..Snapshot::empty()
         };
-        let table = crate::ui::tables::containers_table(&snapshot);
+        let table = crate::ui::tables::containers_table(&snapshot, &HashMap::new());
         assert!(compose_slots(&table, &snapshot.containers, &HashSet::new(), false).is_none());
     }
 
@@ -1168,7 +1169,7 @@ mod tests {
             ..Snapshot::empty()
         };
         let mut tables = [
-            crate::ui::tables::containers_table(&snapshot),
+            crate::ui::tables::containers_table(&snapshot, &HashMap::new()),
             crate::ui::tables::images_table(&snapshot),
             crate::ui::tables::volumes_table(&snapshot),
         ];

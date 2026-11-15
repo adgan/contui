@@ -1973,7 +1973,7 @@ impl RootView {
                                     })
                                     .text_color(theme.text);
                             }
-                            CellStyle::Mono => {
+                            CellStyle::Mono | CellStyle::Cpu | CellStyle::Memory => {
                                 text = text
                                     .font_family("JetBrains Mono")
                                     .text_size(px(12.))
