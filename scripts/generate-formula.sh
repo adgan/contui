@@ -30,4 +30,9 @@ awk -v url="$url" -v sha="$sha" '
     print "  url \"" url "\""
     print "  sha256 \"" sha "\""
   }
-' "$base"
+' "$base" | awk '
+  # Removing the bottle block leaves a blank line on either side of it; two blank lines
+  # in a row are a `brew style` (Layout/EmptyLines) failure for the maintainer.
+  /^[[:space:]]*$/ { if (blank) next; blank = 1; print; next }
+  { blank = 0; print }
+'

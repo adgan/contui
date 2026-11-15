@@ -5,10 +5,14 @@ version="$1" dist="$2"
 mkdir -p "$dist"
 tarball="$dist/contui-$version.tar.gz"
 
-# The tag, when it is there. In CI the checkout is already pinned to the tag, so HEAD is
-# the same commit; the fallback keeps the Linux prepare job working if the ref is absent.
+# The tarball must come from the tag, never from whatever is checked out. A missing tag
+# used to fall back to HEAD, which published a versioned URL whose bytes belonged to no
+# tag and could never be reproduced.
 ref="v$version"
-git rev-parse --verify --quiet "refs/tags/$ref" >/dev/null || ref=HEAD
+git rev-parse --verify --quiet "refs/tags/$ref" >/dev/null || {
+  echo "release-tarball.sh: tag $ref is not present; tag the release commit first" >&2
+  exit 1
+}
 git archive --format=tar.gz --prefix="contui-$version/" -o "$tarball" "$ref"
 
 if command -v sha256sum >/dev/null 2>&1; then
