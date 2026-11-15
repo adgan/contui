@@ -7,6 +7,7 @@ use crate::ui::inspect::InspectNode;
 use crate::ui::mutations::RowMenuState;
 use crate::ui::style::Layout;
 use crate::ui::table::{CellStyle, ColumnWidth};
+use crate::ui::usage::DetailUsage;
 use crate::ui::widgets::button::{ButtonSpec, button};
 use crate::ui::widgets::pill::{state_pill, state_pill_inline};
 use crate::ui::widgets::stat_card::{StatCard, stat_card};
@@ -364,6 +365,16 @@ impl RootView {
             None
         };
         let state = container.as_ref().map(|container| container.state);
+        let detail_usage = if detail.kind == ResourceKind::Container {
+            let connected = matches!(&self.status, HostStatus::Connected);
+            Some(DetailUsage::from(
+                self.usage.get(&detail.id),
+                state.unwrap_or(ContainerState::Unknown),
+                connected,
+            ))
+        } else {
+            None
+        };
 
         let mut meta = div().flex().items_center().gap(px(8.));
         if let Some(state) = state {
@@ -798,6 +809,11 @@ impl RootView {
                     .pt(px(if layout.compact { 16. } else { 20. }))
                     .pb(px(layout.page_padding))
                     .child(hero)
+                    .when_some(detail_usage, |this, usage| {
+                        this.child(crate::ui::usage::render_usage_band(
+                            &usage, &theme, layout,
+                        ))
+                    })
                     .child(tab_strip)
                     .child(
                         crate::ui::style::card(&theme)
