@@ -1503,6 +1503,12 @@ impl RootView {
         let stats = self.stats.clone();
         let loading = stats.is_loading();
         let page = self.page;
+        let usage_totals = UsageTotals::from_snapshot(&self.snapshot, &self.usage);
+        let usage_labels = UsageCardLabels::from(
+            &usage_totals,
+            self.snapshot.fetched_at.is_some(),
+            matches!(&self.status, HostStatus::Connected),
+        );
 
         let containers = stat_card(
             StatCard {
@@ -1531,6 +1537,24 @@ impl RootView {
                     Some(stats.containers_share())
                 },
                 active: page == Page::Containers,
+            },
+            layout,
+            &theme,
+            cx,
+            |this, _window, _cx| this.switch_page(Page::Containers),
+        );
+
+        let usage = stat_card(
+            StatCard {
+                id: "overview-usage",
+                kicker: "Usage",
+                icon: "icons/activity.svg",
+                value: usage_labels.value,
+                unit: "CPU",
+                right: usage_labels.right,
+                foot: usage_labels.foot,
+                progress: None,
+                active: false,
             },
             layout,
             &theme,
@@ -1606,6 +1630,7 @@ impl RootView {
             .flex()
             .gap(px(12.))
             .child(containers)
+            .child(usage)
             .child(images)
             .child(volumes)
     }

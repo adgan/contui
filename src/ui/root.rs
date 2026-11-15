@@ -8,7 +8,7 @@ use crate::theme::Theme;
 use crate::ui::detail::DetailState;
 use crate::ui::inspect::build_tree;
 use crate::ui::mutations::{Mutations, PullState, RunOutcome, RunState, Toast};
-use crate::ui::stats::OverviewStats;
+use crate::ui::stats::{OverviewStats, UsageCardLabels, UsageTotals};
 use crate::ui::table::TableState;
 use chrono::Utc;
 use gpui::prelude::*;
