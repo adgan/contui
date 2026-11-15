@@ -137,6 +137,7 @@ mod tests {
             ports: "5432".into(),
             created: now(),
             created_label: "2m ago".into(),
+            compose_project: None,
         }
     }
 

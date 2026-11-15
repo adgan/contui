@@ -208,6 +208,16 @@ accent rule at the top; hover: hover surface. No gradient.
   12/dim body (max 360px wide). They add no action buttons: the top-bar Run/Pull
   action and the error banner's existing Retry are the only actions, exactly as
   today. No blank white space.
+- Compose grouping: containers carrying `com.docker.compose.project` are bucketed
+  under a 44px group header (chevron, stacked-tile icon, project name, visible
+  container count, running dot/count). Groups sort by project name and standalone
+  containers follow under an `UNGROUPED` section header. Every section header
+  starts with a 12px blank band, which separates consecutive groups without
+  breaking the 44px uniform row height. Clicking a project or `UNGROUPED`
+  header collapses its rows; `↑`/`↓` selection skips collapsed rows. A 32px
+  `Group` toggle in the top bar (Containers only, shown when the host has
+  Compose containers) turns grouping off and on. The toggle is on by default.
+  Filtering and column sorting still apply inside groups.
 - Pull strip and error banner: 36px, 24px horizontal padding, accent-soft or
   error-soft background, bottom border, 12px text; progress bar 120×4.
 - Column widths (final tuning left to the builder):
@@ -231,7 +241,10 @@ accent rule at the top; hover: hover surface. No gradient.
 - Tabs: segmented control below the hero, on the app background, 3px padding,
   radius 10; each tab 30px high, 12/500; selected gets panel-raised surface and
   text color; unselected is dim. No underline.
-- Body card fills the rest: panel surface, border, radius 14.
+- Body card fills the rest: panel surface, border, radius 14. Inspect cards and
+  their rows never shrink inside the scroll container; long keys and values
+  truncate instead of spilling sideways. A live refresh updates the tree in
+  place and keeps the current scroll position instead of remounting the body.
   - **Inspect:** 20px padding, 12px section gaps. Rendering stays mechanical:
     reuse `build_tree(&json, 2)` unchanged. Top-level nodes with scalar values
     become one "Overview" card, a two-column key/value grid in `build_tree`

@@ -50,8 +50,10 @@ stream instead of guessing with a timer.
   Ports, Created instead. (Flagged for approval, see the end of this document.)
 - **No log following.** The Logs tab shows a static tail (last 500 lines) fetched when
   the tab opens, with a refresh button. Continuous follow is v1.1.
-- No Compose grouping, no image pulling or registry auth, no exec/shell, no builds, no
-  Kubernetes, no extensions, no settings screen beyond the host switcher.
+- No Compose lifecycle control (Compose containers are grouped in the list, but
+  start/stop/restart/remove act on one container at a time), no registry auth, no
+  exec/shell, no builds, no Kubernetes, no extensions, no settings screen beyond
+  the host switcher.
 - No Windows or Linux support. GPUI runs there; we will not test or style for it.
 
 ## Anti-goals

@@ -47,6 +47,14 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/chevron-down.svg",
         include_bytes!("../assets/icons/chevron-down.svg"),
     ),
+    (
+        "icons/chevron-right.svg",
+        include_bytes!("../assets/icons/chevron-right.svg"),
+    ),
+    (
+        "icons/compose.svg",
+        include_bytes!("../assets/icons/compose.svg"),
+    ),
     ("icons/back.svg", include_bytes!("../assets/icons/back.svg")),
     (
         "icons/terminal.svg",
@@ -86,7 +94,6 @@ impl AssetSource for Assets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::AssetSource as _;
 
     #[test]
     fn every_icon_is_embedded_and_parses_as_svg() {

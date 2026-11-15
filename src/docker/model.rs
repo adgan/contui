@@ -35,6 +35,8 @@ pub struct ContainerRow {
     pub ports: SharedString,
     pub created: DateTime<Utc>,
     pub created_label: SharedString,
+    /// Docker Compose project name from the container labels, when present.
+    pub compose_project: Option<SharedString>,
 }
 
 impl ContainerRow {
@@ -53,6 +55,14 @@ impl ContainerRow {
             .and_then(|secs| DateTime::from_timestamp(secs, 0))
             .unwrap_or(now);
 
+        let compose_project = summary
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("com.docker.compose.project"))
+            .map(|project| project.trim())
+            .filter(|project| !project.is_empty())
+            .map(|project| SharedString::from(project.to_string()));
+
         Self {
             id,
             short_id,
@@ -63,6 +73,7 @@ impl ContainerRow {
             ports: format_ports(&summary.ports.unwrap_or_default()).into(),
             created,
             created_label: format_ago(created, now).into(),
+            compose_project,
         }
     }
 }
@@ -297,7 +308,9 @@ pub fn status_from_error(error: &bollard::errors::Error) -> HostStatus {
             status_code: 401 | 403,
             message,
         } => HostStatus::AuthFailed(message.clone()),
-        Error::SocketNotFoundError(path) => HostStatus::Unreachable(format!("no such socket: {path}")),
+        Error::SocketNotFoundError(path) => {
+            HostStatus::Unreachable(format!("no such socket: {path}"))
+        }
         Error::IOError { err } => HostStatus::Unreachable(err.to_string()),
         other => HostStatus::Unreachable(other.to_string()),
     }
@@ -401,6 +414,35 @@ mod tests {
     }
 
     #[test]
+    fn reads_compose_project_from_labels() {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            "com.docker.compose.project".to_string(),
+            "sploney".to_string(),
+        );
+        let summary = ContainerSummary {
+            id: Some("abc".into()),
+            labels: Some(labels),
+            ..Default::default()
+        };
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let row = ContainerRow::from_summary(summary, now);
+        assert_eq!(
+            row.compose_project.as_ref().map(|p| p.as_ref()),
+            Some("sploney")
+        );
+
+        let standalone = ContainerRow::from_summary(
+            ContainerSummary {
+                id: Some("def".into()),
+                ..Default::default()
+            },
+            now,
+        );
+        assert!(standalone.compose_project.is_none());
+    }
+
+    #[test]
     fn formats_ports_with_and_without_mapping() {
         let mapped = PortSummary {
             public_port: Some(5432),
@@ -445,7 +487,9 @@ mod tests {
     #[test]
     fn splits_docker_timestamps_from_log_text() {
         let chunks = vec![LogOutput::StdOut {
-            message: b"2026-11-14T21:00:00.123456789Z hello world\n".as_slice().into(),
+            message: b"2026-11-14T21:00:00.123456789Z hello world\n"
+                .as_slice()
+                .into(),
         }];
         let lines = parse_logs(&chunks);
         assert_eq!(lines.len(), 1);

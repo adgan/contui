@@ -2,7 +2,7 @@ use crate::docker::model::{LogLine, ResourceKind};
 use crate::theme::Theme;
 use gpui::UniformListScrollHandle;
 use gpui::prelude::*;
-use gpui::{IntoElement, SharedString, div, px};
+use gpui::{IntoElement, ScrollHandle, SharedString, div, px};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DetailTab {
@@ -22,6 +22,8 @@ pub struct DetailState {
     pub missing: bool,
     pub error: Option<String>,
     pub scroll: UniformListScrollHandle,
+    /// Keeps the inspect viewport where the user left it across live refreshes.
+    pub inspect_scroll: ScrollHandle,
 }
 
 impl DetailState {
@@ -48,6 +50,7 @@ impl DetailState {
             missing: false,
             error: None,
             scroll: UniformListScrollHandle::new(),
+            inspect_scroll: ScrollHandle::default(),
         }
     }
 }

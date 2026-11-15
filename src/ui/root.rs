@@ -24,7 +24,7 @@ use gpui::{
     AnyElement, Context, Div, FocusHandle, FontWeight, KeyDownEvent, MouseButton, Render,
     SharedString, Subscription, Task, Window, div, px, svg, uniform_list,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 const STALE_AFTER_SECS: i64 = 5;
@@ -138,6 +138,10 @@ pub struct RootView {
     pub mutations: Mutations,
     pub host_menu_open: bool,
     pub detail: Option<DetailState>,
+    /// Group Compose containers under their project in the containers list.
+    pub group_containers: bool,
+    pub collapsed_projects: HashSet<String>,
+    pub ungrouped_collapsed: bool,
     search_focus: FocusHandle,
     root_focus: FocusHandle,
     pull_focus: FocusHandle,
@@ -171,6 +175,9 @@ impl RootView {
             mutations: Mutations::new(),
             host_menu_open: false,
             detail: None,
+            group_containers: true,
+            collapsed_projects: HashSet::new(),
+            ungrouped_collapsed: false,
             search_focus: cx.focus_handle(),
             root_focus: cx.focus_handle(),
             pull_focus: cx.focus_handle(),
@@ -451,16 +458,10 @@ impl RootView {
                     }
                 }
             }
-            Response::Dirty { kinds, ids } => {
-                let _ = kinds;
-                if let Some(detail) = &mut self.detail {
-                    let touched = ids
-                        .iter()
-                        .any(|(kind, id)| *kind == detail.kind && *id == detail.id);
-                    if touched && !detail.missing {
-                        detail.inspect = None;
-                    }
-                }
+            Response::Dirty { .. } => {
+                // Keep the open inspect tree on screen while the refetch runs.
+                // Clearing it unmounts the scroll area and jumps the user back
+                // to the top on every container event.
                 if let Some(service) = &self.service {
                     service.request(Request::FetchAll);
                 }
@@ -584,9 +585,110 @@ impl RootView {
 
     pub fn switch_page(&mut self, page: Page) {
         self.page = page;
+        self.detail = None;
         self.host_menu_open = false;
         self.mutations.pull_open = false;
         self.refresh_if_stale();
+    }
+
+    /// The containers list as displayed: Compose project headers with their
+    /// rows, then standalone containers. `None` means render the plain table.
+    fn container_slots(&self) -> Option<Vec<ContainerSlot>> {
+        if self.page != Page::Containers || !self.group_containers {
+            return None;
+        }
+        compose_slots(
+            &self.tables[Page::Containers.index()],
+            &self.snapshot.containers,
+            &self.collapsed_projects,
+            self.ungrouped_collapsed,
+        )
+    }
+
+    fn toggle_ungrouped(&mut self) {
+        self.ungrouped_collapsed = !self.ungrouped_collapsed;
+        if !self.ungrouped_collapsed {
+            return;
+        }
+        let selected_id = {
+            let table = &self.tables[Page::Containers.index()];
+            table
+                .selected
+                .and_then(|ix| table.rows.get(ix))
+                .map(|row| row.id.clone())
+        };
+        let selected_is_hidden = selected_id.is_some_and(|id| {
+            self.snapshot
+                .containers
+                .iter()
+                .find(|container| container.id == id)
+                .is_some_and(|container| container.compose_project.is_none())
+        });
+        if selected_is_hidden {
+            self.tables[Page::Containers.index()].selected = None;
+        }
+    }
+
+    fn toggle_project(&mut self, project: &str) {
+        if self.collapsed_projects.remove(project) {
+            return;
+        }
+        self.collapsed_projects.insert(project.to_string());
+        let selected_id = {
+            let table = &self.tables[Page::Containers.index()];
+            table
+                .selected
+                .and_then(|ix| table.rows.get(ix))
+                .map(|row| row.id.clone())
+        };
+        let selected_is_hidden = selected_id.is_some_and(|id| {
+            self.snapshot
+                .containers
+                .iter()
+                .find(|container| container.id == id)
+                .and_then(|container| container.compose_project.as_ref().map(|p| p.as_ref()))
+                == Some(project)
+        });
+        if selected_is_hidden {
+            self.tables[Page::Containers.index()].selected = None;
+        }
+    }
+
+    /// Arrow-key selection walks the grouped slots so a collapsed project's
+    /// rows are skipped.
+    fn move_selection(&mut self, delta: isize) {
+        let index = self.page.index();
+        if index == Page::Containers.index() {
+            if let Some(slots) = self.container_slots() {
+                let rows: Vec<usize> = slots
+                    .iter()
+                    .filter_map(|slot| match slot {
+                        ContainerSlot::Row(ix) => Some(*ix),
+                        _ => None,
+                    })
+                    .collect();
+                let table = &mut self.tables[index];
+                if rows.is_empty() {
+                    table.selected = None;
+                    return;
+                }
+                table.selected = match table.selected {
+                    None => Some(if delta >= 0 {
+                        rows[0]
+                    } else {
+                        *rows.last().unwrap()
+                    }),
+                    Some(selected) => {
+                        let position = rows.iter().position(|&ix| ix == selected).unwrap_or(0);
+                        let next =
+                            (position as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
+                        Some(rows[next])
+                    }
+                };
+                return;
+            }
+        }
+        self.tables[index].move_selection(delta);
     }
 
     pub fn select_host(&mut self, host_id: &str, cx: &mut Context<Self>) {
@@ -605,9 +707,21 @@ impl RootView {
     }
 
     fn scroll_selection_into_view(&mut self, index: usize) {
-        let table = &self.tables[index];
-        if let Some(position) = table.selection_position() {
-            table
+        let selected = self.tables[index].selected;
+        let grouped_position = if index == Page::Containers.index() {
+            selected.and_then(|selected| {
+                self.container_slots().and_then(|slots| {
+                    slots
+                        .iter()
+                        .position(|slot| matches!(slot, ContainerSlot::Row(ix) if *ix == selected))
+                })
+            })
+        } else {
+            None
+        };
+        let position = grouped_position.or_else(|| self.tables[index].selection_position());
+        if let Some(position) = position {
+            self.tables[index]
                 .scroll
                 .scroll_to_item(position, gpui::ScrollStrategy::Center);
         }
@@ -742,13 +856,13 @@ impl RootView {
         match key {
             "up" => {
                 let index = self.page.index();
-                self.tables[index].move_selection(-1);
+                self.move_selection(-1);
                 self.scroll_selection_into_view(index);
                 cx.notify();
             }
             "down" => {
                 let index = self.page.index();
-                self.tables[index].move_selection(1);
+                self.move_selection(1);
                 self.scroll_selection_into_view(index);
                 cx.notify();
             }
@@ -1598,7 +1712,8 @@ impl RootView {
             } else {
                 match detail.tab {
                     DetailTab::Inspect => match &detail.inspect {
-                        Some(nodes) => render_inspect_cards(nodes, &theme).into_any_element(),
+                        Some(nodes) => render_inspect_cards(nodes, &theme, &detail.inspect_scroll)
+                            .into_any_element(),
                         None => loading_body("Loading inspect…", &theme),
                     },
                     DetailTab::Logs => match &detail.logs {
@@ -1663,7 +1778,9 @@ impl RootView {
 
         let host_chip = self.render_host_chip(cx);
         div()
-            .size_full()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
             .flex()
             .flex_col()
             .child(
@@ -2336,6 +2453,44 @@ impl RootView {
                     cx.notify();
                 },
             ));
+
+            let has_compose = self
+                .snapshot
+                .containers
+                .iter()
+                .any(|container| container.compose_project.is_some());
+            if has_compose {
+                let on = self.group_containers;
+                actions = actions.child(
+                    div()
+                        .id("group-toggle")
+                        .h(px(32.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(if on { theme.accent } else { theme.border })
+                        .bg(if on { theme.accent_soft } else { theme.panel })
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(if on { theme.text } else { theme.text_dim })
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.hover))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.group_containers = !this.group_containers;
+                            cx.notify();
+                        }))
+                        .child(
+                            svg()
+                                .path("icons/compose.svg")
+                                .size(px(14.))
+                                .text_color(if on { theme.accent } else { theme.text_faint }),
+                        )
+                        .child("Group"),
+                );
+            }
         }
         if self.page == Page::Images {
             actions = actions.child(button(
@@ -2639,6 +2794,8 @@ impl RootView {
         let actions = table.spec.actions;
         let row_height = layout.row_height;
         let cell_padding = layout.cell_padding;
+        let slots = self.container_slots();
+        let list_len = slots.as_ref().map_or(visible_count, |slots| slots.len());
 
         let mut header = div()
             .h(px(layout.table_header_height))
@@ -2687,14 +2844,56 @@ impl RootView {
         let scroll_handle = self.tables[index].scroll.clone();
         let list = uniform_list(
             self.tables[index].spec.id,
-            visible_count,
+            list_len,
             cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
                 let mut rows = Vec::with_capacity(range.len());
                 let theme = this.theme.clone();
                 for position in range {
-                    let Some(row_index) = this.tables[index].visible().get(position).copied()
-                    else {
-                        continue;
+                    if let Some(slots) = &slots {
+                        match slots.get(position) {
+                            Some(ContainerSlot::Group {
+                                project,
+                                count,
+                                running,
+                            }) => {
+                                let collapsed = this.collapsed_projects.contains(project.as_ref());
+                                rows.push(group_header(
+                                    project.clone(),
+                                    *count,
+                                    *running,
+                                    collapsed,
+                                    row_height,
+                                    cell_padding,
+                                    &theme,
+                                    cx,
+                                ));
+                                continue;
+                            }
+                            Some(ContainerSlot::Ungrouped { count, running }) => {
+                                rows.push(ungrouped_header(
+                                    *count,
+                                    *running,
+                                    this.ungrouped_collapsed,
+                                    row_height,
+                                    cell_padding,
+                                    &theme,
+                                    cx,
+                                ));
+                                continue;
+                            }
+                            Some(ContainerSlot::Row(_)) => {}
+                            None => continue,
+                        }
+                    }
+                    let row_index = match &slots {
+                        Some(slots) => match slots.get(position) {
+                            Some(ContainerSlot::Row(index)) => *index,
+                            _ => continue,
+                        },
+                        None => match this.tables[index].visible().get(position).copied() {
+                            Some(index) => index,
+                            None => continue,
+                        },
                     };
                     let Some((row_id, cells)) = this.tables[index]
                         .rows
@@ -2903,7 +3102,7 @@ impl RootView {
         .track_scroll(scroll_handle)
         .h_full();
 
-        let body: gpui::AnyElement = if visible_count == 0 {
+        let body: gpui::AnyElement = if list_len == 0 {
             let query = self.current_table().query.clone();
             let (title, detail) = crate::ui::empty::message_for(self.page, &self.status, &query)
                 .unwrap_or_else(|| (self.page.empty_title().to_string(), String::new()));
@@ -3006,6 +3205,307 @@ fn action_enabled(state: Option<ContainerState>, kind: ResourceKind, action: Act
     }
 }
 
+/// One visible line in the grouped containers list. Group headers are 44px
+/// like data rows, so `uniform_list` keeps working.
+#[derive(Clone, Debug, PartialEq)]
+enum ContainerSlot {
+    Group {
+        project: SharedString,
+        count: usize,
+        running: usize,
+    },
+    /// Separates containers without a Compose project from the grouped ones.
+    Ungrouped {
+        count: usize,
+        running: usize,
+    },
+    Row(usize),
+}
+
+/// Buckets the visible container rows by Compose project. Returns `None` when
+/// no visible container carries a project label, so plain hosts keep the flat
+/// list. Groups sort by project name; standalone rows follow.
+fn compose_slots(
+    table: &TableState,
+    containers: &[crate::docker::model::ContainerRow],
+    collapsed: &HashSet<String>,
+    ungrouped_collapsed: bool,
+) -> Option<Vec<ContainerSlot>> {
+    let state_by_id: HashMap<&str, ContainerState> = containers
+        .iter()
+        .map(|container| (container.id.as_str(), container.state))
+        .collect();
+    let project_by_id: HashMap<&str, Option<&str>> = containers
+        .iter()
+        .map(|container| {
+            (
+                container.id.as_str(),
+                container.compose_project.as_ref().map(|p| p.as_ref()),
+            )
+        })
+        .collect();
+
+    let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut standalone = Vec::new();
+    for &index in table.visible() {
+        let Some(row) = table.rows.get(index) else {
+            continue;
+        };
+        match project_by_id.get(row.id.as_str()).copied().flatten() {
+            Some(project) => groups.entry(project).or_default().push(index),
+            None => standalone.push(index),
+        }
+    }
+    if groups.is_empty() {
+        return None;
+    }
+
+    let mut slots = Vec::new();
+    for (project, rows) in groups {
+        let running = rows
+            .iter()
+            .filter(|&&index| {
+                table
+                    .rows
+                    .get(index)
+                    .and_then(|row| state_by_id.get(row.id.as_str()))
+                    == Some(&ContainerState::Running)
+            })
+            .count();
+        slots.push(ContainerSlot::Group {
+            project: SharedString::from(project.to_string()),
+            count: rows.len(),
+            running,
+        });
+        if !collapsed.contains(project) {
+            slots.extend(rows.into_iter().map(ContainerSlot::Row));
+        }
+    }
+    if !standalone.is_empty() {
+        let running = standalone
+            .iter()
+            .filter(|&&index| {
+                table
+                    .rows
+                    .get(index)
+                    .and_then(|row| state_by_id.get(row.id.as_str()))
+                    == Some(&ContainerState::Running)
+            })
+            .count();
+        slots.push(ContainerSlot::Ungrouped {
+            count: standalone.len(),
+            running,
+        });
+        if !ungrouped_collapsed {
+            slots.extend(standalone.into_iter().map(ContainerSlot::Row));
+        }
+    }
+    Some(slots)
+}
+
+/// Height of the blank band that separates one grouped section from the next.
+/// It is part of the 44px header so `uniform_list` keeps a single row height.
+const SECTION_GAP: f32 = 12.0;
+
+fn group_header(
+    project: SharedString,
+    count: usize,
+    running: usize,
+    collapsed: bool,
+    row_height: f32,
+    cell_padding: f32,
+    theme: &Theme,
+    cx: &mut Context<RootView>,
+) -> gpui::Stateful<Div> {
+    let click_project = project.clone();
+    div()
+        .id(SharedString::from(format!("group-{project}")))
+        .w_full()
+        .h(px(row_height))
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .w_full()
+                .h(px(SECTION_GAP))
+                .flex_shrink_0()
+                .bg(theme.panel),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("group-row-{project}")))
+                .flex_1()
+                .min_h(px(0.))
+                .px(px(cell_padding))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .bg(theme.bg)
+                .border_b_1()
+                .border_color(theme.border_subtle)
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.hover))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.toggle_project(click_project.as_ref());
+                    cx.notify();
+                }))
+                .child(
+                    svg()
+                        .path(if collapsed {
+                            "icons/chevron-right.svg"
+                        } else {
+                            "icons/chevron-down.svg"
+                        })
+                        .size(px(14.))
+                        .text_color(theme.text_faint),
+                )
+                .child(
+                    svg()
+                        .path("icons/compose.svg")
+                        .size(px(16.))
+                        .text_color(theme.accent),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.text)
+                        .child(project.clone()),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .text_color(theme.text_faint)
+                        .child(format!(
+                            "{} container{}",
+                            count,
+                            if count == 1 { "" } else { "s" }
+                        )),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .size(px(6.))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(if running > 0 {
+                            theme.running
+                        } else {
+                            theme.exited
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .text_color(if running > 0 {
+                            theme.text_dim
+                        } else {
+                            theme.text_faint
+                        })
+                        .child(format!("{running} running")),
+                ),
+        )
+}
+
+/// Section header for containers without a Compose project. Same 44px shape as
+/// a project header, so it doubles as the spacer between the two sections.
+fn ungrouped_header(
+    count: usize,
+    running: usize,
+    collapsed: bool,
+    row_height: f32,
+    cell_padding: f32,
+    theme: &Theme,
+    cx: &mut Context<RootView>,
+) -> gpui::Stateful<Div> {
+    div()
+        .id("ungrouped-header")
+        .w_full()
+        .h(px(row_height))
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .w_full()
+                .h(px(SECTION_GAP))
+                .flex_shrink_0()
+                .bg(theme.panel),
+        )
+        .child(
+            div()
+                .id("ungrouped-header-row")
+                .flex_1()
+                .min_h(px(0.))
+                .px(px(cell_padding))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .bg(theme.bg)
+                .border_b_1()
+                .border_color(theme.border_subtle)
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.hover))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.toggle_ungrouped();
+                    cx.notify();
+                }))
+                .child(
+                    svg()
+                        .path(if collapsed {
+                            "icons/chevron-right.svg"
+                        } else {
+                            "icons/chevron-down.svg"
+                        })
+                        .size(px(14.))
+                        .text_color(theme.text_faint),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.text_dim)
+                        .child("UNGROUPED"),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .text_color(theme.text_faint)
+                        .child(format!(
+                            "{} container{}",
+                            count,
+                            if count == 1 { "" } else { "s" }
+                        )),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .size(px(6.))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(if running > 0 {
+                            theme.running
+                        } else {
+                            theme.exited
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .text_color(if running > 0 {
+                            theme.text_dim
+                        } else {
+                            theme.text_faint
+                        })
+                        .child(format!("{running} running")),
+                ),
+        )
+}
+
 fn row_menu_item(
     label: &'static str,
     color: gpui::Rgba,
@@ -3070,11 +3570,17 @@ fn page_icon(page: Page) -> &'static str {
 
 /// Inspect rendering stays mechanical: one Overview card for top-level
 /// scalars, then one card per top-level group, all in `build_tree` order.
-fn render_inspect_cards(nodes: &[InspectNode], theme: &Theme) -> impl IntoElement {
+fn render_inspect_cards(
+    nodes: &[InspectNode],
+    theme: &Theme,
+    scroll: &gpui::ScrollHandle,
+) -> impl IntoElement {
     let mut container = div()
         .id("inspect-tree")
         .flex_1()
         .min_h(px(0.))
+        .track_scroll(scroll)
+        .overflow_hidden()
         .overflow_y_scroll()
         .p(px(20.))
         .flex()
@@ -3098,6 +3604,7 @@ fn render_inspect_cards(nodes: &[InspectNode], theme: &Theme) -> impl IntoElemen
 
 fn inspect_card_shell(title: &str, theme: &Theme) -> Div {
     div()
+        .flex_shrink_0()
         .rounded(px(10.))
         .bg(theme.bg)
         .border_1()
@@ -3109,6 +3616,7 @@ fn inspect_card_shell(title: &str, theme: &Theme) -> Div {
                 .px(px(12.))
                 .flex()
                 .items_center()
+                .truncate()
                 .text_size(px(11.))
                 .line_height(px(14.))
                 .font_weight(FontWeight::SEMIBOLD)
@@ -3426,7 +3934,14 @@ mod tests {
             ports: SharedString::from("5432→5432"),
             created: now(),
             created_label: SharedString::from("2m ago"),
+            compose_project: None,
         }
+    }
+
+    fn compose_container(name: &str, state: ContainerState, project: Option<&str>) -> ContainerRow {
+        let mut row = container(name, state);
+        row.compose_project = project.map(|project| SharedString::from(project.to_string()));
+        row
     }
 
     fn image(tag: &str, in_use: bool) -> ImageRow {
@@ -3490,6 +4005,87 @@ mod tests {
             .map(|&ix| table.rows[ix].cells[0].as_ref())
             .collect();
         assert_eq!(names, vec!["bbb", "zzz", "aaa"]);
+    }
+
+    #[test]
+    fn compose_slots_group_projects_alphabetically_and_hide_collapsed_rows() {
+        let snapshot = Snapshot {
+            containers: vec![
+                compose_container("db-1", ContainerState::Running, Some("shop")),
+                compose_container("api-1", ContainerState::Exited, Some("api")),
+                compose_container("solo", ContainerState::Running, None),
+                compose_container("web-1", ContainerState::Running, Some("shop")),
+                compose_container("api-2", ContainerState::Running, Some("api")),
+            ],
+            ..Snapshot::empty()
+        };
+        let table = RootView::containers_table(&snapshot);
+        let slots = compose_slots(&table, &snapshot.containers, &HashSet::new(), false).unwrap();
+
+        let groups: Vec<(&str, usize, usize)> = slots
+            .iter()
+            .filter_map(|slot| match slot {
+                ContainerSlot::Group {
+                    project,
+                    count,
+                    running,
+                } => Some((project.as_ref(), *count, *running)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(groups, vec![("api", 2, 1), ("shop", 2, 2)]);
+        assert_eq!(
+            slots.iter().find_map(|slot| match slot {
+                ContainerSlot::Ungrouped { count, running } => Some((*count, *running)),
+                _ => None,
+            }),
+            Some((1, 1)),
+            "standalone containers get their own section header"
+        );
+        match slots.last().unwrap() {
+            ContainerSlot::Row(index) => assert_eq!(table.rows[*index].id, "solo-id"),
+            _ => panic!("standalone rows follow the groups"),
+        }
+
+        let collapsed = HashSet::from(["shop".to_string()]);
+        let slots = compose_slots(&table, &snapshot.containers, &collapsed, false).unwrap();
+        let visible: Vec<&str> = slots
+            .iter()
+            .filter_map(|slot| match slot {
+                ContainerSlot::Row(index) => Some(table.rows[*index].cells[0].as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert!(!visible.contains(&"web-1"));
+        assert!(!visible.contains(&"db-1"));
+        assert!(visible.contains(&"solo"));
+        assert!(visible.contains(&"api-2"));
+
+        let slots = compose_slots(&table, &snapshot.containers, &HashSet::new(), true).unwrap();
+        let visible: Vec<&str> = slots
+            .iter()
+            .filter_map(|slot| match slot {
+                ContainerSlot::Row(index) => Some(table.rows[*index].cells[0].as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            slots
+                .iter()
+                .any(|slot| matches!(slot, ContainerSlot::Ungrouped { .. }))
+        );
+        assert!(!visible.contains(&"solo"), "collapsed ungrouped rows hide");
+        assert!(visible.contains(&"api-2"));
+    }
+
+    #[test]
+    fn compose_slots_stay_flat_without_project_labels() {
+        let snapshot = Snapshot {
+            containers: vec![container("plain", ContainerState::Running)],
+            ..Snapshot::empty()
+        };
+        let table = RootView::containers_table(&snapshot);
+        assert!(compose_slots(&table, &snapshot.containers, &HashSet::new(), false).is_none());
     }
 
     #[test]
