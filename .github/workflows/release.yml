@@ -22,7 +22,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       VERSION: ${{ inputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/v${{ inputs.version }}
           fetch-depth: 0
@@ -57,7 +57,7 @@ jobs:
         run: scripts/prepare-release.sh "$VERSION" dist
       - name: Publish source tarball
         run: gh release upload "v$VERSION" dist/contui-*.tar.gz
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: formula-base
           path: dist/contui.rb
@@ -75,11 +75,11 @@ jobs:
       HOMEBREW_NO_ANALYTICS: 1
       HOMEBREW_NO_ENV_HINTS: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/v${{ inputs.version }}
           sparse-checkout: scripts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: formula-base
           path: dist
@@ -92,15 +92,13 @@ jobs:
         run: scripts/build-bottle.sh "$VERSION" dist
       - name: Check the artifacts a user actually gets
         run: scripts/check-artifacts.sh "$VERSION" dist
-      - name: Test the installed keg
-        run: brew test adgan/tap/contui
       - name: Publish bottle
         run: gh release upload "v$VERSION" dist/*.bottle.tar.gz
       - name: Publish formula for the tap
         run: |
           # The summary is markdown; unfenced Ruby loses its comments and indentation.
           { echo '```ruby'; cat dist/contui.rb; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: formula
           path: dist/contui.rb

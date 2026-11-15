@@ -44,4 +44,10 @@ for f in "$dist"/contui--"$version".*.bottle.tar.gz; do
   mv "$f" "$dist/$(basename "$f" | sed "s/^contui--$version/contui-$version/")"
 done
 
+# Test the keg here, not in the caller. `brew test` refuses unless the installed keg is
+# the tap's latest version, and the EXIT trap above puts the tap formula back to whatever
+# `brew tap` cloned — the previous release. Run after that and only the release already
+# in the tap could ever pass.
+brew test adgan/tap/contui
+
 ls -1 "$dist"/contui-"$version".*.bottle.tar.gz "$formula"
