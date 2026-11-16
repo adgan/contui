@@ -157,58 +157,60 @@ impl UsageTotals {
     }
 }
 
-/// The text of the overview usage card, with every placeholder decided here so
+/// The text of the host usage footer, with every placeholder decided here so
 /// the render path stays declarative.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct UsageCardLabels {
-    pub value: String,
-    pub right: String,
-    pub foot: String,
+pub struct UsageBarLabels {
+    pub cpu: String,
+    pub memory: String,
+    pub status: String,
 }
 
-impl UsageCardLabels {
+impl UsageBarLabels {
     pub fn from(totals: &UsageTotals, loaded: bool, connected: bool) -> Self {
+        let placeholder = Self {
+            cpu: "—".into(),
+            memory: "—".into(),
+            status: String::new(),
+        };
         if !loaded {
             return Self {
-                value: "—".into(),
-                right: "—".into(),
-                foot: "connecting…".into(),
+                status: "connecting…".into(),
+                ..placeholder
             };
         }
         if !connected {
             return Self {
-                value: "—".into(),
-                right: "—".into(),
-                foot: "host disconnected".into(),
+                status: "host disconnected".into(),
+                ..placeholder
             };
         }
         if totals.running == 0 {
             return Self {
-                value: "0.0%".into(),
-                right: "0 running".into(),
-                foot: "no running containers".into(),
+                cpu: "0.0%".into(),
+                memory: "—".into(),
+                status: "no running containers".into(),
             };
         }
 
-        let value = format_cpu(totals.cpu_percent).unwrap_or_else(|| "—".into());
-        let right = if totals.cpu_reporting < totals.running {
-            format!("{} of {}", totals.cpu_reporting, totals.running)
+        let cpu = format_cpu(totals.cpu_percent).unwrap_or_else(|| "—".into());
+        let memory = totals
+            .memory_bytes
+            .map(|memory| format_bytes(memory as i64))
+            .unwrap_or_else(|| "—".into());
+        let status = if totals.cpu_reporting == 0 && totals.memory_reporting == 0 {
+            "waiting for stats…".into()
+        } else if totals.cpu_reporting < totals.running {
+            format!("{} of {} reporting", totals.cpu_reporting, totals.running)
         } else {
             format!("{} running", totals.running)
         };
-        let foot = match totals.memory_bytes {
-            Some(memory) => {
-                let base = format!("{} memory", format_bytes(memory as i64));
-                if totals.memory_reporting < totals.running {
-                    format!("{base} · {}/{}", totals.memory_reporting, totals.running)
-                } else {
-                    base
-                }
-            }
-            None => "waiting for stats…".into(),
-        };
 
-        Self { value, right, foot }
+        Self {
+            cpu,
+            memory,
+            status,
+        }
     }
 }
 
@@ -419,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn card_labels_show_partial_cpu_and_memory_coverage() {
+    fn bar_labels_show_both_readings_and_partial_cpu_coverage() {
         let totals = UsageTotals {
             cpu_percent: Some(4.1),
             memory_bytes: Some(1_288_490_188),
@@ -427,14 +429,14 @@ mod tests {
             memory_reporting: 3,
             running: 3,
         };
-        let labels = UsageCardLabels::from(&totals, true, true);
-        assert_eq!(labels.value, "4.1%");
-        assert_eq!(labels.right, "2 of 3");
-        assert_eq!(labels.foot, "1.2 GB memory");
+        let labels = UsageBarLabels::from(&totals, true, true);
+        assert_eq!(labels.cpu, "4.1%");
+        assert_eq!(labels.memory, "1.2 GB");
+        assert_eq!(labels.status, "2 of 3 reporting");
     }
 
     #[test]
-    fn card_labels_use_running_count_when_coverage_is_complete() {
+    fn bar_labels_use_running_count_when_cpu_coverage_is_complete() {
         let totals = UsageTotals {
             cpu_percent: Some(4.1),
             memory_bytes: Some(1_288_490_188),
@@ -442,36 +444,37 @@ mod tests {
             memory_reporting: 2,
             running: 3,
         };
-        let labels = UsageCardLabels::from(&totals, true, true);
-        assert_eq!(labels.right, "3 running");
-        assert_eq!(labels.foot, "1.2 GB memory · 2/3");
+        let labels = UsageBarLabels::from(&totals, true, true);
+        assert_eq!(labels.cpu, "4.1%");
+        assert_eq!(labels.memory, "1.2 GB");
+        assert_eq!(labels.status, "3 running");
     }
 
     #[test]
-    fn card_labels_cover_loading_disconnected_empty_and_missing_samples() {
+    fn bar_labels_cover_loading_disconnected_empty_and_missing_samples() {
         let empty = UsageTotals::default();
         assert_eq!(
-            UsageCardLabels::from(&empty, false, false),
-            UsageCardLabels {
-                value: "—".into(),
-                right: "—".into(),
-                foot: "connecting…".into()
+            UsageBarLabels::from(&empty, false, false),
+            UsageBarLabels {
+                cpu: "—".into(),
+                memory: "—".into(),
+                status: "connecting…".into()
             }
         );
         assert_eq!(
-            UsageCardLabels::from(&empty, true, false),
-            UsageCardLabels {
-                value: "—".into(),
-                right: "—".into(),
-                foot: "host disconnected".into()
+            UsageBarLabels::from(&empty, true, false),
+            UsageBarLabels {
+                cpu: "—".into(),
+                memory: "—".into(),
+                status: "host disconnected".into()
             }
         );
         assert_eq!(
-            UsageCardLabels::from(&empty, true, true),
-            UsageCardLabels {
-                value: "0.0%".into(),
-                right: "0 running".into(),
-                foot: "no running containers".into()
+            UsageBarLabels::from(&empty, true, true),
+            UsageBarLabels {
+                cpu: "0.0%".into(),
+                memory: "—".into(),
+                status: "no running containers".into()
             }
         );
 
@@ -479,9 +482,9 @@ mod tests {
             running: 2,
             ..UsageTotals::default()
         };
-        let labels = UsageCardLabels::from(&running_no_samples, true, true);
-        assert_eq!(labels.value, "—");
-        assert_eq!(labels.right, "0 of 2");
-        assert_eq!(labels.foot, "waiting for stats…");
+        let labels = UsageBarLabels::from(&running_no_samples, true, true);
+        assert_eq!(labels.cpu, "—");
+        assert_eq!(labels.memory, "—");
+        assert_eq!(labels.status, "waiting for stats…");
     }
 }

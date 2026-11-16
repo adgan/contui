@@ -10,7 +10,7 @@ use crate::theme::Theme;
 use crate::ui::detail::DetailState;
 use crate::ui::inspect::build_tree;
 use crate::ui::mutations::{Mutations, PullState, RunOutcome, RunState, Toast};
-use crate::ui::stats::{OverviewStats, UsageCardLabels, UsageTotals};
+use crate::ui::stats::{OverviewStats, UsageBarLabels, UsageTotals};
 use crate::ui::table::TableState;
 use chrono::Utc;
 use gpui::prelude::*;
@@ -127,8 +127,8 @@ fn keeps_stats(status: &HostStatus) -> bool {
     matches!(status, HostStatus::Connected)
 }
 
-/// The set of containers whose stats the UI can currently show. The overview
-/// usage card is global, so every list page needs the running containers; the
+/// The set of containers whose stats the UI can currently show. The footer
+/// usage bar is global, so every list page needs the running containers; the
 /// detail page only needs the container it shows. Compose collapse and the
 /// search query deliberately do not prune: the list keeps every running
 /// container's stream alive, like Docker Desktop.
@@ -1290,13 +1290,13 @@ mod tests {
     }
 
     #[test]
-    fn stats_targets_follow_detail_and_the_global_usage_card() {
+    fn stats_targets_follow_detail_and_the_global_usage_bar() {
         let containers = vec![
             container("web", ContainerState::Running),
             container("db", ContainerState::Running),
             container("job", ContainerState::Exited),
         ];
-        // The overview usage card is global, so every list page watches every
+        // The footer usage bar is global, so every list page watches every
         // running container.
         assert_eq!(
             stats_targets_for(None, &containers),

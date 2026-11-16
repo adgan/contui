@@ -1,7 +1,7 @@
 use super::*;
 use crate::docker::actions::{ActionKind, container_actions};
 use crate::docker::model::{ContainerState, ResourceKind, format_bytes};
-use crate::theme::Theme;
+use crate::theme::{Theme, type_scale};
 use crate::ui::detail::{DetailTab, render_logs};
 use crate::ui::inspect::InspectNode;
 use crate::ui::mutations::RowMenuState;
@@ -239,7 +239,7 @@ impl RootView {
         Some(div().absolute().inset_0().child(backdrop).child(panel))
     }
 
-    fn render_toast(&mut self, cx: &mut Context<Self>) -> Option<Div> {
+    fn render_toast(&mut self, layout: &Layout, cx: &mut Context<Self>) -> Option<Div> {
         let toast = self.mutations.toast.clone()?;
         let theme = self.theme.clone();
         let text_color = if toast.error { theme.error } else { theme.text };
@@ -251,7 +251,7 @@ impl RootView {
         Some(
             div()
                 .absolute()
-                .bottom(px(24.))
+                .bottom(px(layout.footer_height + 12.))
                 .left_0()
                 .right_0()
                 .flex()
@@ -1531,12 +1531,6 @@ impl RootView {
         let stats = self.stats.clone();
         let loading = stats.is_loading();
         let page = self.page;
-        let usage_totals = UsageTotals::from_snapshot(&self.snapshot, &self.container_stats);
-        let usage_labels = UsageCardLabels::from(
-            &usage_totals,
-            self.snapshot.fetched_at.is_some(),
-            matches!(&self.status, HostStatus::Connected),
-        );
 
         let containers = stat_card(
             StatCard {
@@ -1565,24 +1559,6 @@ impl RootView {
                     Some(stats.containers_share())
                 },
                 active: page == Page::Containers,
-            },
-            layout,
-            &theme,
-            cx,
-            |this, _window, _cx| this.switch_page(Page::Containers),
-        );
-
-        let usage = stat_card(
-            StatCard {
-                id: "overview-usage",
-                kicker: "Usage",
-                icon: "icons/activity.svg",
-                value: usage_labels.value,
-                unit: "CPU",
-                right: usage_labels.right,
-                foot: usage_labels.foot,
-                progress: None,
-                active: false,
             },
             layout,
             &theme,
@@ -1658,9 +1634,59 @@ impl RootView {
             .flex()
             .gap(px(12.))
             .child(containers)
-            .child(usage)
             .child(images)
             .child(volumes)
+    }
+
+    /// Host-wide CPU and memory, pinned below every screen. The readings moved
+    /// out of the overview strip so the cards stay about resources and the
+    /// live numbers stay visible on detail pages too.
+    fn render_usage_bar(&mut self, layout: &Layout) -> Div {
+        let theme = self.theme.clone();
+        let totals = UsageTotals::from_snapshot(&self.snapshot, &self.container_stats);
+        let labels = UsageBarLabels::from(
+            &totals,
+            self.snapshot.fetched_at.is_some(),
+            matches!(&self.status, HostStatus::Connected),
+        );
+
+        div()
+            .flex_none()
+            .h(px(layout.footer_height))
+            .px(px(layout.page_padding))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .bg(theme.panel)
+            .border_t_1()
+            .border_color(theme.border_subtle)
+            .child(
+                svg()
+                    .path("icons/activity.svg")
+                    .size(px(12.))
+                    .text_color(theme.text_faint),
+            )
+            .child(
+                div()
+                    .text_size(px(type_scale::KICKER))
+                    .line_height(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text_faint)
+                    .child("HOST USAGE"),
+            )
+            .child(div().w(px(1.)).h(px(14.)).bg(theme.border_subtle))
+            .child(usage_reading("CPU", &labels.cpu, &theme))
+            .child(div().w(px(1.)).h(px(14.)).bg(theme.border_subtle))
+            .child(usage_reading("MEMORY", &labels.memory, &theme))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .truncate()
+                    .text_size(px(type_scale::META))
+                    .line_height(px(14.))
+                    .text_color(theme.text_dim)
+                    .child(labels.status),
+            )
     }
 
     fn render_host_menu(&mut self, cx: &mut Context<Self>) -> Option<Div> {
@@ -2483,6 +2509,30 @@ fn meta_dot(theme: &Theme) -> Div {
         .bg(theme.text_faint)
 }
 
+/// One labelled live reading in the usage footer.
+fn usage_reading(label: &str, value: &str, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .gap(px(6.))
+        .child(
+            div()
+                .text_size(px(type_scale::KICKER))
+                .line_height(px(13.))
+                .text_color(theme.text_faint)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .font_family("JetBrains Mono")
+                .text_size(px(type_scale::META))
+                .line_height(px(14.))
+                .text_color(theme.text)
+                .child(value.to_string()),
+        )
+}
+
 fn loading_body(label: &'static str, theme: &Theme) -> gpui::AnyElement {
     div()
         .flex_1()
@@ -2678,6 +2728,7 @@ impl Render for RootView {
         let theme = self.theme.clone();
         let layout = Layout::for_viewport(window.viewport_size());
         let rail = self.render_rail(&layout, cx);
+        let usage_bar = self.render_usage_bar(&layout);
         let menu = self.render_host_menu(cx);
         let content: gpui::AnyElement = if self.detail.is_some() {
             self.render_detail(&layout, cx).into_any_element()
@@ -2830,7 +2881,16 @@ impl Render for RootView {
                 cx.quit();
             }));
 
-        root = root.child(rail).child(content);
+        root = root.child(rail).child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .h_full()
+                .flex()
+                .flex_col()
+                .child(content)
+                .child(usage_bar),
+        );
 
         if let Some(popover) = self.render_pull_popover(window, cx) {
             root = root.child(popover);
@@ -2847,7 +2907,7 @@ impl Render for RootView {
         if let Some(dialog) = self.render_run_dialog(window, cx) {
             root = root.child(dialog);
         }
-        if let Some(toast) = self.render_toast(cx) {
+        if let Some(toast) = self.render_toast(&layout, cx) {
             root = root.child(toast);
         }
 
